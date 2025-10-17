@@ -1,10 +1,4 @@
 // server.js
-// Hardened backend for multi-tenant products + orders (Node + Express + Postgres)
-// Run: node server.js
-// Required env variables (production):
-// PG_HOST, PG_PORT, PG_DATABASE, PG_USER, PG_PASSWORD, JWT_SECRET
-// Optional: JWT_EXPIRES_IN, CORS_ORIGIN, AZURE_STORAGE_CONNECTION_STRING, AZURE_CONTAINER_NAME, ENABLE_RLS
-
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
@@ -22,9 +16,38 @@ const app = express();
 app.use(express.json());
 app.use(helmet());
 
-// CORS origin
-const allowedOrigin = process.env.CORS_ORIGIN || "*";
-app.use(cors({ origin: allowedOrigin }));
+// ----- Robust CORS setup (paste after app.use(helmet()))
+const rawOrigins = process.env.CORS_ORIGINS || process.env.CORS_ORIGIN || "*";
+// Accept a comma-separated list in env: e.g. "http://localhost:3000,http://192.168.1.69:3000"
+const allowedOrigins = rawOrigins
+  ? rawOrigins.split(",").map(s => s.trim()).filter(Boolean)
+  : [
+      "http://localhost:3000",       // local dev
+      "http://127.0.0.1:3000",
+      // you can add your dev machine IP(s) here, e.g. "http://192.168.1.69:3000"
+    ];
+
+const corsOptions = {
+  origin: function (origin, callback) {
+    // Allow requests with no origin (curl, mobile apps, some WebViews)
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+    // Otherwise reject
+    return callback(new Error("CORS: Origin not allowed by server"), false);
+  },
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "Accept", "X-Requested-With"],
+  exposedHeaders: ["Authorization"], // in case you ever return tokens in headers
+  credentials: true, // enable cookies if you later use them
+  optionsSuccessStatus: 204,
+  preflightContinue: false,
+};
+
+app.use(require("cors")(corsOptions));
+// Ensure explicit preflight response for all routes
+app.options("*", require("cors")(corsOptions));
+
+
 
 // Enforce required env vars in production
 if (!process.env.JWT_SECRET || process.env.JWT_SECRET === "change-me") {
@@ -139,9 +162,8 @@ function handleServerError(res, err, context = "") {
   return res.status(500).json({ message: "Internal server error" });
 }
 
-// ------------------- Ensure tables / triggers -------------------
+// ------------------- Ensure tables / migrations -------------------
 async function ensureTablesAndConstraints() {
-  // Use a single client for schema changes
   const client = await pool.connect();
   try {
     // organization_accounts
@@ -188,23 +210,48 @@ async function ensureTablesAndConstraints() {
     `);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_products_owner_id ON products(owner_id);`);
 
-    // orders
+    // orders (ensure columns exist - create table if not exists)
     await client.query(`
       CREATE TABLE IF NOT EXISTS orders (
         order_id SERIAL PRIMARY KEY,
         owner_id INT REFERENCES organization_accounts(id) ON DELETE CASCADE,
         customer_name VARCHAR(255) NOT NULL,
         purchased_items TEXT,
+        total_amount NUMERIC(12,2) DEFAULT 0,
         order_status VARCHAR(20) NOT NULL DEFAULT 'Pending',
         payment_status VARCHAR(20) NOT NULL DEFAULT 'Unpaid',
         order_date TIMESTAMP,
         delivery_date TIMESTAMP,
+        payment_date TIMESTAMP,
+        stock_adjusted BOOLEAN DEFAULT FALSE,
         remarks TEXT,
         created_at TIMESTAMP DEFAULT NOW(),
         updated_at TIMESTAMP DEFAULT NOW()
       );
     `);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_orders_owner_id ON orders(owner_id);`);
+
+    // IDEMPOTENTLY ADD COLUMNS that might be missing on older DBs
+    await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS total_amount NUMERIC(12,2) DEFAULT 0;`);
+    await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_date TIMESTAMP;`);
+    await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS stock_adjusted BOOLEAN DEFAULT FALSE;`);
+
+    // order_items table (structured line items)
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS order_items (
+        id SERIAL PRIMARY KEY,
+        order_id INT NOT NULL REFERENCES orders(order_id) ON DELETE CASCADE,
+        product_id INT NOT NULL REFERENCES products(product_id),
+        owner_id INT NOT NULL,
+        quantity INT NOT NULL CHECK (quantity > 0),
+        unit_price NUMERIC(12,2) NOT NULL,
+        total_price NUMERIC(12,2) NOT NULL,
+        fulfilled BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+    `);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_order_items_order_id ON order_items(order_id);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_order_items_product_id ON order_items(product_id);`);
 
     // order_audit with FK to orders
     await client.query(`
@@ -223,6 +270,39 @@ async function ensureTablesAndConstraints() {
     `);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_order_audit_order_id ON order_audit(order_id);`);
 
+    // ========== AUTOMATION TABLES ==========
+    // automation_rules table
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS automation_rules (
+        id SERIAL PRIMARY KEY,
+        owner_id INT NOT NULL REFERENCES organization_accounts(id) ON DELETE CASCADE,
+        name VARCHAR(255) NOT NULL,
+        trigger TEXT NOT NULL,
+        action TEXT NOT NULL,
+        status VARCHAR(20) NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'paused')),
+        last_run TIMESTAMP,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      );
+    `);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_automation_rules_owner_id ON automation_rules(owner_id);`);
+
+    // automation_alerts table
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS automation_alerts (
+        id SERIAL PRIMARY KEY,
+        owner_id INT NOT NULL REFERENCES organization_accounts(id) ON DELETE CASCADE,
+        type VARCHAR(20) NOT NULL CHECK (type IN ('warning', 'error', 'success', 'info')),
+        title VARCHAR(255) NOT NULL,
+        message TEXT NOT NULL,
+        time TIMESTAMP DEFAULT NOW(),
+        status VARCHAR(20) NOT NULL DEFAULT 'unread' CHECK (status IN ('read', 'unread')),
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+    `);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_automation_alerts_owner_id ON automation_alerts(owner_id);`);
+
+    // ========== TRIGGERS ==========
     // updated_at trigger function and triggers for tables that have updated_at
     await client.query(`
       CREATE OR REPLACE FUNCTION trigger_set_updated_at()
@@ -252,13 +332,19 @@ async function ensureTablesAndConstraints() {
           BEFORE UPDATE ON orders
           FOR EACH ROW EXECUTE FUNCTION trigger_set_updated_at();
         END IF;
+
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_trigger WHERE tgname = 'automation_rules_set_updated_at'
+        ) THEN
+          CREATE TRIGGER automation_rules_set_updated_at
+          BEFORE UPDATE ON automation_rules
+          FOR EACH ROW EXECUTE FUNCTION trigger_set_updated_at();
+        END IF;
       END $$;
     `);
 
     // Optional: recommended RLS setup if ENABLE_RLS=true (does nothing if not set)
     if (process.env.ENABLE_RLS === "true") {
-      // Note: enabling RLS is irreversible for existing apps unless you carefully manage policies.
-      // These policies assume current_setting('app.current_owner') is set per-transaction by the app.
       await client.query(`ALTER TABLE IF EXISTS products ENABLE ROW LEVEL SECURITY;`);
       await client.query(`
         DO $$
@@ -279,7 +365,7 @@ async function ensureTablesAndConstraints() {
       `);
     }
 
-    console.log("✅ Tables & triggers ensured");
+    console.log("✅ Tables & triggers ensured (with order_items + totals + flags + automation)");
   } finally {
     client.release();
   }
@@ -341,7 +427,6 @@ app.post("/api/register", authLimiter, async (req, res) => {
   }
 });
 
-
 // Require authenticateJWT middleware and return a consistent object
 app.get("/api/details", authenticateJWT, async (req, res) => {
   try {
@@ -368,7 +453,7 @@ app.get("/api/details", authenticateJWT, async (req, res) => {
 
     // map to front-end shape (choose names front expects)
     const out = {
-      fullName: row.organization_name, // if you want a different mapping change on frontend
+      fullName: row.organization_name,
       username: row.username,
       companyName: row.organization_name,
       email: row.email,
@@ -383,7 +468,6 @@ app.get("/api/details", authenticateJWT, async (req, res) => {
     return res.status(500).json({ message: "Internal server error" });
   }
 });
-
 
 app.post("/api/login", authLimiter, async (req, res) => {
   const { email, password } = req.body || {};
@@ -427,6 +511,147 @@ app.post("/api/login", authLimiter, async (req, res) => {
   }
 });
 
+// ------------------- AUTOMATION: rules + alerts -------------------
+
+app.get("/api/rules", authenticateJWT, async (req, res) => {
+  try {
+    const ownerId = Number(req.user.organizationId || 0);
+    if (!ownerId) return res.status(400).json({ message: "Invalid organization" });
+
+    const q = `SELECT id, owner_id, name, trigger, action, status, last_run, created_at, updated_at
+               FROM automation_rules WHERE owner_id = $1 ORDER BY created_at DESC;`;
+    const result = await pool.query(q, [ownerId]);
+    const rows = result.rows.map(r => {
+      const out = toCamel(r);
+      out.lastRun = r.last_run ? r.last_run.toISOString() : "";
+      return out;
+    });
+    return res.json(rows);
+  } catch (err) {
+    return handleServerError(res, err, "GET /api/rules error:");
+  }
+});
+
+app.post("/api/rules", authenticateJWT, async (req, res) => {
+  const ownerId = Number(req.user.organizationId || 0);
+  if (!ownerId) return res.status(400).json({ message: "Invalid organization" });
+
+  const { name, trigger, action, status } = req.body || {};
+  if (!name || !trigger || !action) return res.status(400).json({ message: "name, trigger and action required" });
+
+  const st = status === "paused" ? "paused" : "active";
+
+  try {
+    const q = `INSERT INTO automation_rules (owner_id, name, trigger, action, status)
+               VALUES ($1,$2,$3,$4,$5) RETURNING id, owner_id, name, trigger, action, status, last_run, created_at, updated_at;`;
+    const r = (await pool.query(q, [ownerId, name, trigger, action, st])).rows[0];
+    const out = toCamel(r);
+    out.lastRun = r.last_run ? r.last_run.toISOString() : "";
+    return res.status(201).json(out);
+  } catch (err) {
+    return handleServerError(res, err, "POST /api/rules error:");
+  }
+});
+
+app.put("/api/rules/:id", authenticateJWT, async (req, res) => {
+  const ownerId = Number(req.user.organizationId || 0);
+  const id = Number(req.params.id);
+  if (!ownerId || !id) return res.status(400).json({ message: "Invalid organization or id" });
+
+  // allow partial updates to name, trigger, action, status, last_run
+  const allowed = ["name", "trigger", "action", "status", "last_run"];
+  const sets = [];
+  const vals = [];
+  let idx = 1;
+  for (const key of allowed) {
+    if (req.body[key] !== undefined) {
+      sets.push(`${key} = $${idx++}`);
+      vals.push(req.body[key]);
+    }
+  }
+  if (sets.length === 0) return res.status(400).json({ message: "No updatable fields provided" });
+
+  vals.push(ownerId);
+  vals.push(id);
+  const sql = `UPDATE automation_rules SET ${sets.join(", ")} WHERE owner_id = $${idx++} AND id = $${idx} RETURNING id, owner_id, name, trigger, action, status, last_run, created_at, updated_at;`;
+
+  try {
+    const r = (await pool.query(sql, vals)).rows[0];
+    if (!r) return res.status(404).json({ message: "Rule not found" });
+    const out = toCamel(r);
+    out.lastRun = r.last_run ? r.last_run.toISOString() : "";
+    return res.json(out);
+  } catch (err) {
+    return handleServerError(res, err, "PUT /api/rules/:id error:");
+  }
+});
+
+app.delete("/api/rules/:id", authenticateJWT, async (req, res) => {
+  const ownerId = Number(req.user.organizationId || 0);
+  const id = Number(req.params.id);
+  if (!ownerId || !id) return res.status(400).json({ message: "Invalid organization or id" });
+
+  try {
+    const r = await pool.query("DELETE FROM automation_rules WHERE id = $1 AND owner_id = $2", [id, ownerId]);
+    if (r.rowCount === 0) return res.status(404).json({ message: "Rule not found" });
+    return res.json({ message: "Deleted" });
+  } catch (err) {
+    return handleServerError(res, err, "DELETE /api/rules/:id error:");
+  }
+});
+
+/* Alerts */
+app.get("/api/alerts", authenticateJWT, async (req, res) => {
+  try {
+    const ownerId = Number(req.user.organizationId || 0);
+    if (!ownerId) return res.status(400).json({ message: "Invalid organization" });
+
+    const q = `SELECT id, owner_id, type, title, message, time, status, created_at FROM automation_alerts WHERE owner_id = $1 ORDER BY time DESC;`;
+    const result = await pool.query(q, [ownerId]);
+    const rows = result.rows.map(a => {
+      const out = toCamel(a);
+      out.time = a.time ? a.time.toISOString() : "";
+      return out;
+    });
+    return res.json(rows);
+  } catch (err) {
+    return handleServerError(res, err, "GET /api/alerts error:");
+  }
+});
+
+app.post("/api/alerts", authenticateJWT, async (req, res) => {
+  const ownerId = Number(req.user.organizationId || 0);
+  if (!ownerId) return res.status(400).json({ message: "Invalid organization" });
+  const { type, title, message } = req.body || {};
+  if (!type || !title || !message) return res.status(400).json({ message: "type, title, message required" });
+
+  if (!["warning","error","success","info"].includes(type)) return res.status(400).json({ message: "Invalid type" });
+
+  try {
+    const q = `INSERT INTO automation_alerts (owner_id, type, title, message) VALUES ($1,$2,$3,$4) RETURNING id, owner_id, type, title, message, time, status, created_at;`;
+    const r = (await pool.query(q, [ownerId, type, title, message])).rows[0];
+    return res.status(201).json(toCamel(r));
+  } catch (err) {
+    return handleServerError(res, err, "POST /api/alerts error:");
+  }
+});
+
+app.put("/api/alerts/:id/status", authenticateJWT, async (req, res) => {
+  const ownerId = Number(req.user.organizationId || 0);
+  const id = Number(req.params.id);
+  const { status } = req.body || {};
+  if (!ownerId || !id) return res.status(400).json({ message: "Invalid organization or id" });
+  if (!["read","unread"].includes(status)) return res.status(400).json({ message: "Invalid status" });
+
+  try {
+    const r = (await pool.query("UPDATE automation_alerts SET status = $1 WHERE id = $2 AND owner_id = $3 RETURNING id, status", [status, id, ownerId])).rows[0];
+    if (!r) return res.status(404).json({ message: "Alert not found" });
+    return res.json(r);
+  } catch (err) {
+    return handleServerError(res, err, "PUT /api/alerts/:id/status error:");
+  }
+});
+
 // ------------------- PRODUCTS -------------------
 
 // List products (simple read, no transaction overhead)
@@ -443,7 +668,7 @@ app.get("/api/products", authenticateJWT, async (req, res) => {
     const rows = result.rows.map((r) => {
       const c = toCamel(r);
       // normalize types
-      c.id = String(r.product_id);
+      c.id = Number(r.product_id);
       c.price = Number(r.price);
       c.stock = Number(r.stock || 0);
       c.ordersReceived = Number(r.orders_received || 0);
@@ -492,7 +717,7 @@ app.post("/api/products", authenticateJWT, upload.single("image"), async (req, r
       const vals = [ownerId, name, description, price, stock, imageUrl];
       const r = (await client.query(insertQ, vals)).rows[0];
       const out = toCamel(r);
-      out.id = String(r.product_id);
+      out.id = Number(r.product_id);
       out.price = Number(r.price);
       out.stock = Number(r.stock);
       out.ordersReceived = Number(r.orders_received || 0);
@@ -505,7 +730,7 @@ app.post("/api/products", authenticateJWT, upload.single("image"), async (req, r
   }
 });
 
-// PATCH stock (decrement) - transactional
+// PATCH stock (decrement) - transactional (kept for direct adjustments)
 app.patch("/api/products/:id/stock", authenticateJWT, async (req, res) => {
   const ownerId = Number(req.user.organizationId || 0);
   if (!ownerId) return res.status(400).json({ message: "Invalid organization" });
@@ -524,7 +749,7 @@ app.patch("/api/products/:id/stock", authenticateJWT, async (req, res) => {
       if (newStock < 0) throw { status: 400, message: "Insufficient stock" };
       const upd = await client.query("UPDATE products SET stock = $1, orders_received = COALESCE(orders_received,0)+$2 WHERE product_id = $3 AND owner_id = $4 RETURNING product_id, stock, orders_received;", [newStock, qty, productId, ownerId]);
       const r = upd.rows[0];
-      return { id: String(r.product_id), stock: Number(r.stock), ordersReceived: Number(r.orders_received || 0) };
+      return { id: Number(r.product_id), stock: Number(r.stock), ordersReceived: Number(r.orders_received || 0) };
     });
     return res.json(updated);
   } catch (err) {
@@ -535,26 +760,74 @@ app.patch("/api/products/:id/stock", authenticateJWT, async (req, res) => {
 
 // ------------------- ORDERS -------------------
 
-// GET orders (reads)
+// GET orders (reads) — returns itemized orders
 app.get("/api/orders", authenticateJWT, async (req, res) => {
   const ownerId = Number(req.user.organizationId || 0);
   if (!ownerId) return res.status(400).json({ message: "Invalid organization" });
 
   try {
-    const q = `SELECT order_id, owner_id, customer_name, purchased_items, order_status, payment_status, order_date, delivery_date, remarks, created_at, updated_at FROM orders WHERE owner_id = $1 ORDER BY created_at DESC;`;
+    const q = `
+      SELECT o.order_id, o.owner_id, o.customer_name, o.purchased_items, o.total_amount, o.order_status, o.payment_status, o.order_date, o.delivery_date, o.payment_date, o.remarks, o.created_at, o.updated_at
+      FROM orders o
+      WHERE o.owner_id = $1
+      ORDER BY o.created_at DESC;
+    `;
     const result = await pool.query(q, [ownerId]);
-    const rows = result.rows.map((r) => {
-      const c = toCamel(r);
-      c.id = String(r.order_id);
-      return c;
+    const orders = result.rows;
+
+    // fetch items for these orders in one query
+    const orderIds = orders.map(r => r.order_id);
+    let itemsByOrder = new Map();
+    if (orderIds.length > 0) {
+      const itemsQ = `
+        SELECT id, order_id, product_id, quantity, unit_price, total_price, fulfilled, created_at
+        FROM order_items
+        WHERE order_id = ANY($1::int[])
+        ORDER BY created_at ASC;
+      `;
+      const itemsRes = await pool.query(itemsQ, [orderIds]);
+      for (const it of itemsRes.rows) {
+        const key = Number(it.order_id);
+        const arr = itemsByOrder.get(key) || [];
+        arr.push({
+          id: Number(it.id),
+          productId: Number(it.product_id),
+          quantity: Number(it.quantity),
+          unitPrice: Number(it.unit_price),
+          totalPrice: Number(it.total_price),
+          fulfilled: Boolean(it.fulfilled),
+          createdAt: it.created_at
+        });
+        itemsByOrder.set(key, arr);
+      }
+    }
+
+    const rows = orders.map((r) => {
+      const idNum = Number(r.order_id);
+      return {
+        id: idNum,
+        customerName: r.customer_name,
+        purchasedItems: r.purchased_items,
+        totalAmount: Number(r.total_amount || 0),
+        orderStatus: r.order_status,
+        paymentStatus: r.payment_status,
+        orderDate: r.order_date,
+        deliveryDate: r.delivery_date,
+        paymentDate: r.payment_date,
+        remarks: r.remarks,
+        createdAt: r.created_at,
+        updatedAt: r.updated_at,
+        items: itemsByOrder.get(idNum) || []
+      };
     });
+
     return res.json(rows);
   } catch (err) {
     return handleServerError(res, err, "GET /api/orders error:");
   }
 });
 
-// POST order (create + audit)
+// POST order (create + insert order_items + decrement stock + audit) - transactional
 app.post("/api/orders", authenticateJWT, async (req, res) => {
   const ownerId = Number(req.user.organizationId || 0);
   const loginId = Number(req.user.id || 0);
@@ -568,6 +841,7 @@ app.post("/api/orders", authenticateJWT, async (req, res) => {
     orderDate = null,
     deliveryDate = null,
     remarks = "",
+    items = [],
   } = req.body || {};
 
   if (!customerName) return res.status(400).json({ message: "customerName required" });
@@ -577,33 +851,177 @@ app.post("/api/orders", authenticateJWT, async (req, res) => {
   if (!allowedOrderStatuses.includes(orderStatus)) return res.status(400).json({ message: "Invalid orderStatus" });
   if (!allowedPaymentStatuses.includes(paymentStatus)) return res.status(400).json({ message: "Invalid paymentStatus" });
 
+  if (!Array.isArray(items) || items.length === 0) {
+    return res.status(400).json({ message: "items array required with at least one item" });
+  }
+  for (const it of items) {
+    if (!it || !it.productId || Number(it.quantity) <= 0) {
+      return res.status(400).json({ message: "Each item requires productId and quantity>0" });
+    }
+  }
+
   try {
     const created = await withTransaction(async (client) => {
-      await client.query(`SET LOCAL app.current_owner = '${ownerId}'`).catch(() => {});
-      const q = `INSERT INTO orders (owner_id, customer_name, purchased_items, order_status, payment_status, order_date, delivery_date, remarks) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING order_id, owner_id, customer_name, purchased_items, order_status, payment_status, order_date, delivery_date, remarks, created_at, updated_at;`;
-      const vals = [ownerId, customerName, purchasedItems, orderStatus, paymentStatus, orderDate, deliveryDate, remarks];
-      const r = (await client.query(q, vals)).rows[0];
+      try { await client.query(`SET LOCAL app.current_owner = '${ownerId}'`); } catch (_) {}
+
+      const q = `
+        INSERT INTO orders (owner_id, customer_name, purchased_items, total_amount, order_status, payment_status, order_date, delivery_date, remarks, stock_adjusted)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+        RETURNING order_id, owner_id, customer_name, purchased_items, total_amount, order_status, payment_status, order_date, delivery_date, remarks, created_at, updated_at;
+      `;
+      const placeholderTotal = 0;
+      const vals = [ownerId, customerName, purchasedItems, placeholderTotal, orderStatus, paymentStatus, orderDate, deliveryDate, remarks, false];
+      const orderRow = (await client.query(q, vals)).rows[0];
+      const orderId = orderRow.order_id;
+
+      const insertedItems = [];
+      let runningTotal = 0;
+      const productIds = [...new Set(items.map(i => Number(i.productId)))];
+
+      const prodRes = await client.query(
+        `SELECT product_id, owner_id, price, stock FROM products WHERE product_id = ANY($1::int[]) AND owner_id = $2 FOR UPDATE`,
+        [productIds, ownerId]
+      );
+      const prodMap = new Map(prodRes.rows.map(r => [Number(r.product_id), { price: Number(r.price), stock: Number(r.stock || 0) }]));
+
+      for (const it of items) {
+        const productId = Number(it.productId);
+        const qty = Number(it.quantity);
+        if (!prodMap.has(productId)) {
+          throw { status: 404, message: `Product ${productId} not found for this organization` };
+        }
+        const prod = prodMap.get(productId);
+        if (prod.stock < qty) {
+          throw { status: 400, message: `Insufficient stock for product ${productId} (required ${qty}, available ${prod.stock})` };
+        }
+        const unitPrice = Number(prod.price);
+        const totalPrice = Number((unitPrice * qty).toFixed(2));
+        runningTotal += totalPrice;
+
+        await client.query(
+          `UPDATE products
+           SET stock = stock - $1,
+               orders_received = COALESCE(orders_received,0) + $1
+           WHERE product_id = $2 AND owner_id = $3`,
+          [qty, productId, ownerId]
+        );
+
+        const insertItemQ = `
+          INSERT INTO order_items (order_id, product_id, owner_id, quantity, unit_price, total_price, fulfilled)
+          VALUES ($1,$2,$3,$4,$5,$6,$7)
+          RETURNING id, order_id, product_id, quantity, unit_price, total_price, fulfilled, created_at;
+        `;
+        const itemRow = (await client.query(insertItemQ, [orderId, productId, ownerId, qty, unitPrice, totalPrice, true])).rows[0];
+
+        insertedItems.push({
+          id: Number(itemRow.id),
+          orderId: Number(itemRow.order_id),
+          productId: Number(itemRow.product_id),
+          quantity: Number(itemRow.quantity),
+          unitPrice: Number(itemRow.unit_price),
+          totalPrice: Number(itemRow.total_price),
+          fulfilled: itemRow.fulfilled,
+          createdAt: itemRow.created_at
+        });
+      }
+
+      const updOrder = await client.query(
+        `UPDATE orders SET total_amount = $1, stock_adjusted = true WHERE order_id = $2 RETURNING order_id, total_amount, order_status, payment_status, created_at, updated_at;`,
+        [Number(runningTotal.toFixed(2)), orderId]
+      );
 
       const auditQ = `INSERT INTO order_audit (order_id, owner_id, action, changed_by_login_id, old_value, new_value, note) VALUES ($1,$2,$3,$4,$5,$6,$7)`;
-      await client.query(auditQ, [r.order_id, ownerId, "create", loginId, null, JSON.stringify(r), `Created by login ${loginId}`]);
+      await client.query(auditQ, [
+        orderId,
+        ownerId,
+        "create",
+        loginId,
+        null,
+        JSON.stringify({ order: updOrder.rows[0], items: insertedItems }),
+        `Created by login ${loginId}`
+      ]);
 
-      const out = toCamel(r);
-      out.id = String(r.order_id);
+      const out = {
+        id: Number(orderId),
+        customerName: customerName,
+        purchasedItems: purchasedItems,
+        totalAmount: Number(runningTotal.toFixed(2)),
+        orderStatus: orderStatus,
+        paymentStatus: paymentStatus,
+        orderDate: orderDate,
+        deliveryDate: deliveryDate,
+        remarks: remarks,
+        createdAt: updOrder.rows[0].created_at,
+        updatedAt: updOrder.rows[0].updated_at,
+        items: insertedItems
+      };
+
       return out;
     });
 
     return res.status(201).json(created);
   } catch (err) {
+    if (err && err.status) return res.status(err.status).json({ message: err.message });
     return handleServerError(res, err, "POST /api/orders error:");
   }
 });
 
-// PATCH order status
+// PATCH order payment (update payment_status + payment_date + audit) — does NOT reverse stock
+app.patch("/api/orders/:id/payment", authenticateJWT, async (req, res) => {
+  const ownerId = Number(req.user.organizationId || 0);
+  const loginId = Number(req.user.id || 0);
+  const orderId = Number(req.params.id);
+  const { paymentStatus } = req.body || {};
+
+  if (!ownerId) return res.status(400).json({ message: "Invalid organization" });
+  if (!orderId) return res.status(400).json({ message: "Invalid order id" });
+  if (!paymentStatus || !["Paid","Unpaid","Refunded"].includes(paymentStatus)) {
+    return res.status(400).json({ message: "Invalid paymentStatus" });
+  }
+
+  try {
+    const updated = await withTransaction(async (client) => {
+      try { await client.query(`SET LOCAL app.current_owner = '${ownerId}'`); } catch (_) {}
+
+      const orderRes = await client.query("SELECT order_id, payment_status FROM orders WHERE order_id = $1 AND owner_id = $2 FOR UPDATE", [orderId, ownerId]);
+      if (orderRes.rows.length === 0) throw { status: 404, message: "Order not found" };
+      const oldPayment = orderRes.rows[0].payment_status;
+
+      if (oldPayment === paymentStatus) {
+        return { id: orderId, paymentStatus: oldPayment, note: "No change" };
+      }
+
+      if (paymentStatus === "Paid") {
+        const upd = await client.query("UPDATE orders SET payment_status = $1, payment_date = NOW() WHERE order_id = $2 AND owner_id = $3 RETURNING order_id, payment_status, payment_date, updated_at;", [paymentStatus, orderId, ownerId]);
+
+        const auditQ = `INSERT INTO order_audit (order_id, owner_id, action, changed_by_login_id, old_value, new_value, note) VALUES ($1,$2,$3,$4,$5,$6,$7)`;
+        await client.query(auditQ, [orderId, ownerId, "update_payment", loginId, JSON.stringify({ payment_status: oldPayment }), JSON.stringify({ payment_status: paymentStatus }), `Payment changed ${oldPayment} -> ${paymentStatus} by login ${loginId}`]);
+
+        return toCamel(upd.rows[0]);
+      } else {
+        const upd = await client.query("UPDATE orders SET payment_status = $1 WHERE order_id = $2 AND owner_id = $3 RETURNING order_id, payment_status, payment_date, updated_at;", [paymentStatus, orderId, ownerId]);
+
+        const auditQ = `INSERT INTO order_audit (order_id, owner_id, action, changed_by_login_id, old_value, new_value, note) VALUES ($1,$2,$3,$4,$5,$6,$7)`;
+        await client.query(auditQ, [orderId, ownerId, "update_payment", loginId, JSON.stringify({ payment_status: oldPayment }), JSON.stringify({ payment_status: paymentStatus }), `Payment changed ${oldPayment} -> ${paymentStatus} by login ${loginId}`]);
+
+        return toCamel(upd.rows[0]);
+      }
+    });
+
+    return res.json(updated);
+  } catch (err) {
+    if (err && err.status) return res.status(err.status).json({ message: err.message });
+    return handleServerError(res, err, "PATCH /api/orders/:id/payment error:");
+  }
+});
+
+// PATCH order status (Delivered / Pending / Cancelled) — sets delivery_date when Delivered
 app.patch("/api/orders/:id/status", authenticateJWT, async (req, res) => {
   const ownerId = Number(req.user.organizationId || 0);
   const loginId = Number(req.user.id || 0);
   const orderId = Number(req.params.id);
   const { orderStatus } = req.body || {};
+
   if (!ownerId) return res.status(400).json({ message: "Invalid organization" });
   if (!orderId || !orderStatus) return res.status(400).json({ message: "orderId and orderStatus required" });
 
@@ -612,61 +1030,44 @@ app.patch("/api/orders/:id/status", authenticateJWT, async (req, res) => {
 
   try {
     const updated = await withTransaction(async (client) => {
-      await client.query(`SET LOCAL app.current_owner = '${ownerId}'`).catch(() => {});
-      const check = await client.query("SELECT order_status FROM orders WHERE order_id = $1 AND owner_id = $2 FOR UPDATE", [orderId, ownerId]);
-      if (check.rows.length === 0) throw { status: 404, message: "Order not found" };
-      const oldStatus = check.rows[0].order_status;
-      if (oldStatus === orderStatus) return { id: String(orderId), orderStatus: oldStatus };
+      try { await client.query(`SET LOCAL app.current_owner = '${ownerId}'`); } catch (_) {}
 
-      const upd = await client.query("UPDATE orders SET order_status = $1 WHERE order_id = $2 AND owner_id = $3 RETURNING order_id, order_status, updated_at", [orderStatus, orderId, ownerId]);
-      const r = upd.rows[0];
+      const check = await client.query("SELECT order_status, delivery_date FROM orders WHERE order_id = $1 AND owner_id = $2 FOR UPDATE", [orderId, ownerId]);
+      if (check.rows.length === 0) throw { status: 404, message: "Order not found" };
+
+      const oldStatus = check.rows[0].order_status;
+      const oldDelivery = check.rows[0].delivery_date;
+
+      if (oldStatus === orderStatus) {
+        return { id: orderId, orderStatus: oldStatus, note: "No change" };
+      }
+
+      let upd;
+      if (orderStatus === "Delivered") {
+        const deliveryDate = oldDelivery || new Date().toISOString();
+        upd = await client.query("UPDATE orders SET order_status = $1, delivery_date = $2 WHERE order_id = $3 AND owner_id = $4 RETURNING order_id, order_status, delivery_date, updated_at", [orderStatus, deliveryDate, orderId, ownerId]);
+      } else {
+        upd = await client.query("UPDATE orders SET order_status = $1 WHERE order_id = $2 AND owner_id = $3 RETURNING order_id, order_status, delivery_date, updated_at", [orderStatus, orderId, ownerId]);
+      }
 
       const auditQ = `INSERT INTO order_audit (order_id, owner_id, action, changed_by_login_id, old_value, new_value, note) VALUES ($1,$2,$3,$4,$5,$6,$7)`;
-      await client.query(auditQ, [orderId, ownerId, "update_status", loginId, JSON.stringify({ order_status: oldStatus }), JSON.stringify({ order_status: r.order_status }), `Status changed ${oldStatus} -> ${r.order_status} by login ${loginId}`]);
+      await client.query(auditQ, [
+        orderId,
+        ownerId,
+        "update_status",
+        loginId,
+        JSON.stringify({ order_status: oldStatus }),
+        JSON.stringify({ order_status: orderStatus }),
+        `Status changed ${oldStatus} -> ${orderStatus} by login ${loginId}`
+      ]);
 
-      return { id: String(r.order_id), orderStatus: r.order_status, updatedAt: r.updated_at };
+      return toCamel(upd.rows[0]);
     });
 
     return res.json(updated);
   } catch (err) {
     if (err && err.status) return res.status(err.status).json({ message: err.message });
     return handleServerError(res, err, "PATCH /api/orders/:id/status error:");
-  }
-});
-
-// PATCH payment status
-app.patch("/api/orders/:id/payment", authenticateJWT, async (req, res) => {
-  const ownerId = Number(req.user.organizationId || 0);
-  const loginId = Number(req.user.id || 0);
-  const orderId = Number(req.params.id);
-  const { paymentStatus } = req.body || {};
-  if (!ownerId) return res.status(400).json({ message: "Invalid organization" });
-  if (!orderId || !paymentStatus) return res.status(400).json({ message: "orderId and paymentStatus required" });
-
-  const allowedPaymentStatuses = ["Paid", "Unpaid", "Refunded"];
-  if (!allowedPaymentStatuses.includes(paymentStatus)) return res.status(400).json({ message: "Invalid paymentStatus" });
-
-  try {
-    const updated = await withTransaction(async (client) => {
-      await client.query(`SET LOCAL app.current_owner = '${ownerId}'`).catch(() => {});
-      const check = await client.query("SELECT payment_status FROM orders WHERE order_id = $1 AND owner_id = $2 FOR UPDATE", [orderId, ownerId]);
-      if (check.rows.length === 0) throw { status: 404, message: "Order not found" };
-      const oldPayment = check.rows[0].payment_status;
-      if (oldPayment === paymentStatus) return { id: String(orderId), paymentStatus: oldPayment };
-
-      const upd = await client.query("UPDATE orders SET payment_status = $1 WHERE order_id = $2 AND owner_id = $3 RETURNING order_id, payment_status, updated_at", [paymentStatus, orderId, ownerId]);
-      const r = upd.rows[0];
-
-      const auditQ = `INSERT INTO order_audit (order_id, owner_id, action, changed_by_login_id, old_value, new_value, note) VALUES ($1,$2,$3,$4,$5,$6,$7)`;
-      await client.query(auditQ, [orderId, ownerId, "update_payment", loginId, JSON.stringify({ payment_status: oldPayment }), JSON.stringify({ payment_status: r.payment_status }), `Payment changed ${oldPayment} -> ${r.payment_status} by login ${loginId}`]);
-
-      return { id: String(r.order_id), paymentStatus: r.payment_status, updatedAt: r.updated_at };
-    });
-
-    return res.json(updated);
-  } catch (err) {
-    if (err && err.status) return res.status(err.status).json({ message: err.message });
-    return handleServerError(res, err, "PATCH /api/orders/:id/payment error:");
   }
 });
 
