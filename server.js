@@ -11,10 +11,20 @@ const { BlobServiceClient } = require("@azure/storage-blob");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const rateLimit = require("express-rate-limit");
+const crypto = require('crypto');
+const nodemailer = require('nodemailer');
 
 const app = express();
 app.use(express.json());
 app.use(helmet());
+
+// Rate limiter for verification emails
+const verificationLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute window
+  max: 3,               // limit each IP to 3 requests per minute
+  message: "Too many verification requests, please try again later.",
+});
+
 
 // ----- Robust CORS setup (paste after app.use(helmet()))
 const rawOrigins = process.env.CORS_ORIGINS || process.env.CORS_ORIGIN || "*";
@@ -29,10 +39,13 @@ const allowedOrigins = rawOrigins
 
 const corsOptions = {
   origin: function (origin, callback) {
-    // Allow requests with no origin (curl, mobile apps, some WebViews)
-    if (!origin) return callback(null, true);
+    if (!origin) {
+      console.log("CORS: no origin (curl / mobile webview?) - allow");
+      return callback(null, true);
+    }
+    console.log("CORS: request origin:", origin);
     if (allowedOrigins.includes(origin)) return callback(null, true);
-    // Otherwise reject
+    console.warn("CORS: origin not allowed:", origin);
     return callback(new Error("CORS: Origin not allowed by server"), false);
   },
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
@@ -43,11 +56,7 @@ const corsOptions = {
   preflightContinue: false,
 };
 
-app.use(require("cors")(corsOptions));
-// Ensure explicit preflight response for all routes
-app.options("*", require("cors")(corsOptions));
-
-
+app.use(cors(corsOptions));
 
 // Enforce required env vars in production
 if (!process.env.JWT_SECRET || process.env.JWT_SECRET === "change-me") {
@@ -58,17 +67,46 @@ if (!process.env.JWT_SECRET || process.env.JWT_SECRET === "change-me") {
 const JWT_SECRET = process.env.JWT_SECRET;
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || "7d";
 
+
+const transporter = nodemailer.createTransport({
+  service: 'gmail',
+  auth: {
+    user: process.env.GMAIL_USER,
+    pass: process.env.GMAIL_APP_PASSWORD
+  }
+});
+
+// quick optional SMTP check (keep for a minute, then remove)
+transporter.verify()
+  .then(() => console.log('SMTP ready'))
+  .catch(err => console.error('SMTP error', err));
 // Postgres pool
 const pool = new Pool({
-  host: process.env.PG_HOST || "localhost",
-  port: Number(process.env.PG_PORT || 5432),
-  database: process.env.PG_DATABASE || "postgres",
-  user: process.env.PG_USER || "postgres",
-  password: process.env.PG_PASSWORD || "postgres",
+  connectionString: process.env.DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false // Neon requires SSL
+  },
   max: 20,
   idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 2000,
+  connectionTimeoutMillis: 10000, // Increased for network latency
 });
+
+// Optional: Add connection error handling
+pool.on('error', (err, client) => {
+  console.error('Unexpected error on idle client', err);
+  process.exit(-1);
+});
+
+// Test the connection on startup
+pool.connect()
+  .then(client => {
+    console.log('✅ Neon PostgreSQL connected successfully');
+    client.release();
+  })
+  .catch(err => {
+    console.error('❌ Failed to connect to Neon PostgreSQL:', err.message);
+    process.exit(1);
+  });
 
 // Azure Blob (optional)
 const AZURE_CONN = process.env.AZURE_STORAGE_CONNECTION_STRING;
@@ -192,6 +230,24 @@ async function ensureTablesAndConstraints() {
         created_at TIMESTAMP DEFAULT NOW()
       );
     `);
+
+    // Add email_verified column to login (idempotent)
+    await client.query(`ALTER TABLE login ADD COLUMN IF NOT EXISTS email_verified BOOLEAN DEFAULT FALSE;`);
+
+    // Create email_verification_tokens table for verification flow
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS email_verification_tokens (
+        id SERIAL PRIMARY KEY,
+        login_id INT REFERENCES login(id) ON DELETE CASCADE,
+        email VARCHAR(255) NOT NULL,
+        token_hash VARCHAR(128) NOT NULL,
+        expires_at TIMESTAMP NOT NULL,
+        used BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+    `);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_email_verification_token_hash ON email_verification_tokens(token_hash);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_email_verification_expires_at ON email_verification_tokens(expires_at);`);
 
     // products
     await client.query(`
@@ -354,7 +410,7 @@ async function ensureTablesAndConstraints() {
           END IF;
         END $$;
       `);
-      await client.query(`ALTER TABLE IF EXISTS orders ENABLE ROW LEVEL SECURITY;`);
+      await client.query(`ALTER TABLE IF NOT EXISTS orders ENABLE ROW LEVEL SECURITY;`);
       await client.query(`
         DO $$
         BEGIN
@@ -365,11 +421,12 @@ async function ensureTablesAndConstraints() {
       `);
     }
 
-    console.log("✅ Tables & triggers ensured (with order_items + totals + flags + automation)");
+    console.log("✅ Tables & triggers ensured (with order_items + totals + flags + automation + email verification)");
   } finally {
     client.release();
   }
 }
+
 
 // ------------------- AUTH ROUTES -------------------
 
@@ -1070,6 +1127,85 @@ app.patch("/api/orders/:id/status", authenticateJWT, async (req, res) => {
     return handleServerError(res, err, "PATCH /api/orders/:id/status error:");
   }
 });
+app.post("/api/send-verification", verificationLimiter, async (req, res) => {
+  const { email } = req.body || {};
+  if (!email) return res.status(400).json({ message: "Email required" });
+
+  const normalized = String(email).trim().toLowerCase();
+  try {
+    // find login (may not exist if user didn't finish register)
+    const loginRes = await pool.query("SELECT id FROM login WHERE email = $1 LIMIT 1", [normalized]);
+    const loginId = loginRes.rows.length ? loginRes.rows[0].id : null;
+
+    // generate token (plaintext to send), store hashed
+    const tokenPlain = crypto.randomBytes(24).toString("hex"); // 48 hex chars
+    const tokenHash = crypto.createHash("sha256").update(tokenPlain).digest("hex");
+    const expiresAt = new Date(Date.now() + (Number(process.env.CODE_EXPIRE_MINUTES || 15) * 60 * 1000));
+
+    await pool.query(
+      `INSERT INTO email_verification_tokens (login_id, email, token_hash, expires_at)
+       VALUES ($1,$2,$3,$4)`,
+      [loginId, normalized, tokenHash, expiresAt]
+    );
+
+    // link points to server verify endpoint which will mark email_verified = true and redirect to frontend
+    const verifyUrl = `${process.env.APP_BASE_URL || "http://localhost:3000"}/api/verify-email?token=${tokenPlain}`;
+
+    // mail payload
+    const mailOptions = {
+      from: process.env.EMAIL_FROM,
+      to: normalized,
+      subject: "Verify your email",
+      text: `Click the link to verify your email: ${verifyUrl}\n\nThis link expires in ${process.env.CODE_EXPIRE_MINUTES || 15} minutes.`,
+      html: `<p>Click the link to verify your email:</p><p><a href="${verifyUrl}">Verify email</a></p><p>This link expires in ${process.env.CODE_EXPIRE_MINUTES || 15} minutes.</p>`
+    };
+
+    transporter.sendMail(mailOptions).catch(err => console.error("sendMail error:", err));
+
+    // Generic response to avoid account enumeration
+    return res.status(200).json({ message: "If that email exists, a verification link has been sent." });
+  } catch (err) {
+    return handleServerError(res, err, "send-verification error:");
+  }
+});
+
+app.get("/api/verify-email", async (req, res) => {
+  const token = String(req.query.token || "");
+  if (!token) return res.status(400).send("Missing token");
+
+  try {
+    const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
+    const q = `SELECT id, login_id, email, expires_at, used FROM email_verification_tokens WHERE token_hash = $1 LIMIT 1`;
+    const r = await pool.query(q, [tokenHash]);
+
+    const redirectBase = process.env.APP_BASE_URL || "http://localhost:3000";
+
+    if (r.rows.length === 0) {
+      return res.redirect(`${redirectBase}/verified?status=invalid`);
+    }
+
+    const row = r.rows[0];
+    if (row.used) return res.redirect(`${redirectBase}/verified?status=used`);
+    if (new Date(row.expires_at) < new Date()) return res.redirect(`${redirectBase}/verified?status=expired`);
+
+    // mark token used
+    await pool.query("UPDATE email_verification_tokens SET used = true WHERE id = $1", [row.id]);
+
+    // set login.email_verified = true for the matching login (either by id or email)
+    if (row.login_id) {
+      await pool.query("UPDATE login SET email_verified = true WHERE id = $1", [row.login_id]);
+    } else {
+      await pool.query("UPDATE login SET email_verified = true WHERE email = $1", [row.email]);
+    }
+
+    return res.redirect(`${redirectBase}/verified?status=success`);
+  } catch (err) {
+    console.error("verify-email error:", err);
+    const redirectBase = process.env.APP_BASE_URL || "http://localhost:3000";
+    return res.redirect(`${redirectBase}/verified?status=error`);
+  }
+});
+
 
 // GET order audit entries
 app.get("/api/order-audit/:orderId", authenticateJWT, async (req, res) => {
@@ -1097,7 +1233,9 @@ async function init() {
     console.log("✅ PostgreSQL pool connected");
     await ensureTablesAndConstraints();
     const PORT = process.env.PORT || 3001;
-    app.listen(PORT, () => console.log(`Server listening on http://localhost:${PORT}`));
+    const HOST = process.env.HOST || "0.0.0.0";
+    app.listen(PORT, HOST, () => console.log(`Server listening on http://${HOST}:${PORT}`));
+
   } catch (err) {
     console.error("Fatal init error:", err);
     process.exit(1);
