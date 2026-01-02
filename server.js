@@ -34,7 +34,10 @@ const HOST = process.env.HOST || "0.0.0.0";
 // ==================== CORS SETUP ====================
 
 const corsOptions = {
-  origin: true, // <-- allow any origin
+   origin: [
+    "http://localhost:3000",
+    "https://ecommerce-manage-frontend-ewq7.vercel.app"
+  ],
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization", "Accept", "X-Requested-With"],
   exposedHeaders: ["Authorization"],
