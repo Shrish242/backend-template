@@ -11,31 +11,32 @@ const { BlobServiceClient } = require("@azure/storage-blob");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const rateLimit = require("express-rate-limit");
-const crypto = require('crypto');
-const nodemailer = require('nodemailer');
+const crypto = require("crypto");
+const nodemailer = require("nodemailer");
 
 const app = express();
 app.use(express.json());
 app.use(helmet());
 
-// Rate limiter for verification emails
-const verificationLimiter = rateLimit({
-  windowMs: 60 * 1000, // 1 minute window
-  max: 3,               // limit each IP to 3 requests per minute
-  message: "Too many verification requests, please try again later.",
-});
+// ==================== CONFIGURATION ====================
 
+// Enforce required env vars
+if (!process.env.JWT_SECRET || process.env.JWT_SECRET === "change-me") {
+  console.error("FATAL: JWT_SECRET must be set to a secure value in environment.");
+  process.exit(1);
+}
 
-// ----- Robust CORS setup (paste after app.use(helmet()))
+const JWT_SECRET = process.env.JWT_SECRET;
+const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || "7d";
+const PORT = process.env.PORT || 3001;
+const HOST = process.env.HOST || "0.0.0.0";
+
+// ==================== CORS SETUP ====================
+
 const rawOrigins = process.env.CORS_ORIGINS || process.env.CORS_ORIGIN || "*";
-// Accept a comma-separated list in env: e.g. "http://localhost:3000,http://192.168.1.69:3000"
 const allowedOrigins = rawOrigins
-  ? rawOrigins.split(",").map(s => s.trim()).filter(Boolean)
-  : [
-      "http://localhost:3000",       // local dev
-      "http://127.0.0.1:3000",
-      // you can add your dev machine IP(s) here, e.g. "http://192.168.1.69:3000"
-    ];
+  ? rawOrigins.split(",").map((s) => s.trim()).filter(Boolean)
+  : ["http://localhost:3000", "http://127.0.0.1:3000" ];
 
 const corsOptions = {
   origin: function (origin, callback) {
@@ -50,81 +51,100 @@ const corsOptions = {
   },
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization", "Accept", "X-Requested-With"],
-  exposedHeaders: ["Authorization"], // in case you ever return tokens in headers
-  credentials: true, // enable cookies if you later use them
+  exposedHeaders: ["Authorization"],
+  credentials: true,
   optionsSuccessStatus: 204,
   preflightContinue: false,
 };
 
 app.use(cors(corsOptions));
 
-// Enforce required env vars in production
-if (!process.env.JWT_SECRET || process.env.JWT_SECRET === "change-me") {
-  console.error("FATAL: JWT_SECRET must be set to a secure value in environment.");
-  process.exit(1);
-}
+// ==================== RATE LIMITERS ====================
 
-const JWT_SECRET = process.env.JWT_SECRET;
-const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || "7d";
-
-
-const transporter = nodemailer.createTransport({
-  service: 'gmail',
-  auth: {
-    user: process.env.GMAIL_USER,
-    pass: process.env.GMAIL_APP_PASSWORD
-  }
+const authLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 10,
+  message: { message: "Too many requests, slow down" },
 });
 
-// quick optional SMTP check (keep for a minute, then remove)
-transporter.verify()
-  .then(() => console.log('SMTP ready'))
-  .catch(err => console.error('SMTP error', err));
-// Postgres pool
+const verificationLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 3,
+  message: "Too many verification requests, please try again later.",
+});
+
+// ==================== DATABASE SETUP ====================
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: {
-    rejectUnauthorized: false // Neon requires SSL
-  },
-  max: 20,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 10000, // Increased for network latency
+  ssl: process.env.DATABASE_URL?.includes('sslmode=require') || process.env.NODE_ENV === "production"
+    ? { rejectUnauthorized: false }
+    : process.env.DATABASE_SSL === 'true'
+    ? { rejectUnauthorized: false }
+    : false,
+  max: Number(process.env.PG_MAX_CLIENTS) || 10,
+  idleTimeoutMillis: Number(process.env.PG_IDLE_TIMEOUT_MS) || 30000,
+  connectionTimeoutMillis: Number(process.env.PG_CONN_TIMEOUT_MS) || 10000,
+  keepAlive: true,
+  keepAliveInitialDelayMillis: 10000,
 });
 
-// Optional: Add connection error handling
-pool.on('error', (err, client) => {
-  console.error('Unexpected error on idle client', err);
-  process.exit(-1);
+// Handle pool errors gracefully
+pool.on("error", (err, client) => {
+  console.error("Unexpected error on idle client:", err.message || err);
+  // Don't exit - let the pool handle reconnection
 });
 
-// Test the connection on startup
-pool.connect()
-  .then(client => {
-    console.log('✅ Neon PostgreSQL connected successfully');
-    client.release();
-  })
-  .catch(err => {
-    console.error('❌ Failed to connect to Neon PostgreSQL:', err.message);
-    process.exit(1);
+pool.on("connect", (client) => {
+  console.log("New client connected to pool");
+});
+
+pool.on("remove", (client) => {
+  console.log("Client removed from pool");
+});
+
+// ==================== EMAIL SETUP ====================
+
+let transporter = null;
+if (process.env.GMAIL_USER && process.env.GMAIL_APP_PASSWORD) {
+  transporter = nodemailer.createTransport({
+    service: "gmail",
+    auth: {
+      user: process.env.GMAIL_USER,
+      pass: process.env.GMAIL_APP_PASSWORD,
+    },
   });
 
-// Azure Blob (optional)
+  // Verify SMTP connection without crashing
+  transporter
+    .verify()
+    .then(() => console.log("✅ SMTP ready"))
+    .catch((err) => console.warn("⚠️  SMTP error:", err.message));
+}
+
+// ==================== AZURE BLOB STORAGE ====================
+
 const AZURE_CONN = process.env.AZURE_STORAGE_CONNECTION_STRING;
 const AZURE_CONTAINER = process.env.AZURE_CONTAINER_NAME || "product-images";
 let containerClient = null;
+
 if (AZURE_CONN) {
   try {
     const blobServiceClient = BlobServiceClient.fromConnectionString(AZURE_CONN);
     containerClient = blobServiceClient.getContainerClient(AZURE_CONTAINER);
+    console.log("✅ Azure Blob Storage configured");
   } catch (err) {
-    console.warn("Azure Blob init failed:", err.message || err);
+    console.warn("⚠️  Azure Blob init failed:", err.message || err);
     containerClient = null;
   }
 }
 
-// Multer config: use disk storage to avoid OOM; validate file types
+// ==================== MULTER SETUP ====================
+
 const uploadDir = path.join(__dirname, "uploads");
-if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
+if (!fs.existsSync(uploadDir)) {
+  fs.mkdirSync(uploadDir, { recursive: true });
+}
 
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, uploadDir),
@@ -133,11 +153,11 @@ const storage = multer.diskStorage({
     cb(null, safeName);
   },
 });
+
 const upload = multer({
   storage,
   limits: { fileSize: 12 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
-    // Accept common image types only
     if (!file.mimetype.startsWith("image/")) {
       return cb(new Error("Only image files are allowed"));
     }
@@ -145,10 +165,8 @@ const upload = multer({
   },
 });
 
-// Rate limiters
-const authLimiter = rateLimit({ windowMs: 60 * 1000, max: 10, message: { message: "Too many requests, slow down" } });
+// ==================== UTILITY FUNCTIONS ====================
 
-// ------------------- Utilities -------------------
 function signToken(user) {
   const payload = { id: user.id, email: user.email, organizationId: user.organizationId };
   return jwt.sign(payload, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
@@ -157,7 +175,9 @@ function signToken(user) {
 async function authenticateJWT(req, res, next) {
   try {
     const auth = req.headers.authorization;
-    if (!auth || !auth.startsWith("Bearer ")) return res.status(401).json({ message: "Missing authorization" });
+    if (!auth || !auth.startsWith("Bearer ")) {
+      return res.status(401).json({ message: "Missing authorization" });
+    }
     const token = auth.slice(7);
     const decoded = jwt.verify(token, JWT_SECRET);
     req.user = { id: decoded.id, email: decoded.email, organizationId: decoded.organizationId };
@@ -167,14 +187,13 @@ async function authenticateJWT(req, res, next) {
   }
 }
 
-// Only use transactions for writes. Helper:
 async function withTransaction(clientCallback) {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-    const rv = await clientCallback(client);
+    const result = await clientCallback(client);
     await client.query("COMMIT");
-    return rv;
+    return result;
   } catch (err) {
     await client.query("ROLLBACK");
     throw err;
@@ -183,7 +202,6 @@ async function withTransaction(clientCallback) {
   }
 }
 
-// Convert row keys snake_case -> camelCase
 function toCamel(obj) {
   if (!obj || typeof obj !== "object") return obj;
   const out = {};
@@ -194,13 +212,13 @@ function toCamel(obj) {
   return out;
 }
 
-// Standardized internal server error logger + user-safe message
 function handleServerError(res, err, context = "") {
   console.error(context || "Server error:", err);
   return res.status(500).json({ message: "Internal server error" });
 }
 
-// ------------------- Ensure tables / migrations -------------------
+// ==================== DATABASE INITIALIZATION ====================
+
 async function ensureTablesAndConstraints() {
   const client = await pool.connect();
   try {
@@ -227,14 +245,12 @@ async function ensureTablesAndConstraints() {
         email VARCHAR(255) NOT NULL UNIQUE,
         password TEXT NOT NULL,
         organization_id INT,
+        email_verified BOOLEAN DEFAULT FALSE,
         created_at TIMESTAMP DEFAULT NOW()
       );
     `);
 
-    // Add email_verified column to login (idempotent)
-    await client.query(`ALTER TABLE login ADD COLUMN IF NOT EXISTS email_verified BOOLEAN DEFAULT FALSE;`);
-
-    // Create email_verification_tokens table for verification flow
+    // email_verification_tokens
     await client.query(`
       CREATE TABLE IF NOT EXISTS email_verification_tokens (
         id SERIAL PRIMARY KEY,
@@ -266,7 +282,7 @@ async function ensureTablesAndConstraints() {
     `);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_products_owner_id ON products(owner_id);`);
 
-    // orders (ensure columns exist - create table if not exists)
+    // orders
     await client.query(`
       CREATE TABLE IF NOT EXISTS orders (
         order_id SERIAL PRIMARY KEY,
@@ -287,12 +303,7 @@ async function ensureTablesAndConstraints() {
     `);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_orders_owner_id ON orders(owner_id);`);
 
-    // IDEMPOTENTLY ADD COLUMNS that might be missing on older DBs
-    await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS total_amount NUMERIC(12,2) DEFAULT 0;`);
-    await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_date TIMESTAMP;`);
-    await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS stock_adjusted BOOLEAN DEFAULT FALSE;`);
-
-    // order_items table (structured line items)
+    // order_items
     await client.query(`
       CREATE TABLE IF NOT EXISTS order_items (
         id SERIAL PRIMARY KEY,
@@ -309,7 +320,7 @@ async function ensureTablesAndConstraints() {
     await client.query(`CREATE INDEX IF NOT EXISTS idx_order_items_order_id ON order_items(order_id);`);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_order_items_product_id ON order_items(product_id);`);
 
-    // order_audit with FK to orders
+    // order_audit
     await client.query(`
       CREATE TABLE IF NOT EXISTS order_audit (
         id SERIAL PRIMARY KEY,
@@ -326,8 +337,7 @@ async function ensureTablesAndConstraints() {
     `);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_order_audit_order_id ON order_audit(order_id);`);
 
-    // ========== AUTOMATION TABLES ==========
-    // automation_rules table
+    // automation_rules
     await client.query(`
       CREATE TABLE IF NOT EXISTS automation_rules (
         id SERIAL PRIMARY KEY,
@@ -343,7 +353,7 @@ async function ensureTablesAndConstraints() {
     `);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_automation_rules_owner_id ON automation_rules(owner_id);`);
 
-    // automation_alerts table
+    // automation_alerts
     await client.query(`
       CREATE TABLE IF NOT EXISTS automation_alerts (
         id SERIAL PRIMARY KEY,
@@ -358,8 +368,7 @@ async function ensureTablesAndConstraints() {
     `);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_automation_alerts_owner_id ON automation_alerts(owner_id);`);
 
-    // ========== TRIGGERS ==========
-    // updated_at trigger function and triggers for tables that have updated_at
+    // Triggers for updated_at
     await client.query(`
       CREATE OR REPLACE FUNCTION trigger_set_updated_at()
       RETURNS TRIGGER AS $$
@@ -373,25 +382,19 @@ async function ensureTablesAndConstraints() {
     await client.query(`
       DO $$
       BEGIN
-        IF NOT EXISTS (
-          SELECT 1 FROM pg_trigger WHERE tgname = 'products_set_updated_at'
-        ) THEN
+        IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'products_set_updated_at') THEN
           CREATE TRIGGER products_set_updated_at
           BEFORE UPDATE ON products
           FOR EACH ROW EXECUTE FUNCTION trigger_set_updated_at();
         END IF;
 
-        IF NOT EXISTS (
-          SELECT 1 FROM pg_trigger WHERE tgname = 'orders_set_updated_at'
-        ) THEN
+        IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'orders_set_updated_at') THEN
           CREATE TRIGGER orders_set_updated_at
           BEFORE UPDATE ON orders
           FOR EACH ROW EXECUTE FUNCTION trigger_set_updated_at();
         END IF;
 
-        IF NOT EXISTS (
-          SELECT 1 FROM pg_trigger WHERE tgname = 'automation_rules_set_updated_at'
-        ) THEN
+        IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'automation_rules_set_updated_at') THEN
           CREATE TRIGGER automation_rules_set_updated_at
           BEFORE UPDATE ON automation_rules
           FOR EACH ROW EXECUTE FUNCTION trigger_set_updated_at();
@@ -399,38 +402,20 @@ async function ensureTablesAndConstraints() {
       END $$;
     `);
 
-    // Optional: recommended RLS setup if ENABLE_RLS=true (does nothing if not set)
-    if (process.env.ENABLE_RLS === "true") {
-      await client.query(`ALTER TABLE IF EXISTS products ENABLE ROW LEVEL SECURITY;`);
-      await client.query(`
-        DO $$
-        BEGIN
-          IF NOT EXISTS (SELECT 1 FROM pg_policy WHERE polname = 'org_products_policy') THEN
-            CREATE POLICY org_products_policy ON products USING (owner_id = current_setting('app.current_owner')::int);
-          END IF;
-        END $$;
-      `);
-      await client.query(`ALTER TABLE IF NOT EXISTS orders ENABLE ROW LEVEL SECURITY;`);
-      await client.query(`
-        DO $$
-        BEGIN
-          IF NOT EXISTS (SELECT 1 FROM pg_policy WHERE polname = 'org_orders_policy') THEN
-            CREATE POLICY org_orders_policy ON orders USING (owner_id = current_setting('app.current_owner')::int);
-          END IF;
-        END $$;
-      `);
-    }
-
-    console.log("✅ Tables & triggers ensured (with order_items + totals + flags + automation + email verification)");
+    console.log("✅ Tables & triggers ensured");
+  } catch (err) {
+    console.error("❌ Database setup error:", err);
+    throw err;
   } finally {
     client.release();
   }
 }
 
+// ==================== AUTH ROUTES ====================
 
-// ------------------- AUTH ROUTES -------------------
-
-app.get("/api/register", (req, res) => res.status(200).json({ message: "POST /api/register to create an account" }));
+app.get("/api/register", (req, res) => {
+  res.status(200).json({ message: "POST /api/register to create an account" });
+});
 
 app.post("/api/register", authLimiter, async (req, res) => {
   const {
@@ -446,16 +431,16 @@ app.post("/api/register", authLimiter, async (req, res) => {
   } = req.body || {};
 
   try {
-    // Basic required checks
+    // Validation
     if (!organizationName || !email || !password || !confirmPassword || !username || !contactNumber || !panNumber || !location || acceptTerms !== true) {
       return res.status(400).json({ message: "All fields required and terms must be accepted" });
     }
-    if (password !== confirmPassword) return res.status(400).json({ message: "Passwords do not match" });
-
-    // Contact number: digits only, min length 7
-    if (!/^\d{7,}$/.test(contactNumber)) return res.status(400).json({ message: "Invalid contact number format" });
-
-    // Password policy: min 8 chars, at least 1 uppercase, 1 number
+    if (password !== confirmPassword) {
+      return res.status(400).json({ message: "Passwords do not match" });
+    }
+    if (!/^\d{7,}$/.test(contactNumber)) {
+      return res.status(400).json({ message: "Invalid contact number format" });
+    }
     if (password.length < 8 || !/[A-Z]/.test(password) || !/\d/.test(password)) {
       return res.status(400).json({ message: "Password must be at least 8 characters, include an uppercase letter and a number" });
     }
@@ -464,19 +449,25 @@ app.post("/api/register", authLimiter, async (req, res) => {
     const hash = await bcrypt.hash(password, saltRounds);
 
     const result = await withTransaction(async (client) => {
-      const insertOrg = `INSERT INTO organization_accounts (organization_name, email, username, password, contact_number, pan_number, location, accept_terms) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id;`;
+      const insertOrg = `
+        INSERT INTO organization_accounts (organization_name, email, username, password, contact_number, pan_number, location, accept_terms)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id;
+      `;
       const orgRes = await client.query(insertOrg, [organizationName, email, username, hash, contactNumber, panNumber.toUpperCase(), location, acceptTerms]);
       const orgId = orgRes.rows[0].id;
 
       const insertLogin = `INSERT INTO login (email, password, organization_id) VALUES ($1,$2,$3) RETURNING id, email, organization_id;`;
       const loginRes = await client.query(insertLogin, [email, hash, orgId]);
 
-      return { id: loginRes.rows[0].id, email: loginRes.rows[0].email, organizationId: loginRes.rows[0].organization_id };
+      return {
+        id: loginRes.rows[0].id,
+        email: loginRes.rows[0].email,
+        organizationId: loginRes.rows[0].organization_id,
+      };
     });
 
     return res.status(201).json({ message: "Registered", user: result });
   } catch (err) {
-    // handle unique violation cleanly
     if (err && err.code === "23505") {
       return res.status(409).json({ message: "Duplicate value", detail: err.detail || null });
     }
@@ -484,55 +475,17 @@ app.post("/api/register", authLimiter, async (req, res) => {
   }
 });
 
-// Require authenticateJWT middleware and return a consistent object
-app.get("/api/details", authenticateJWT, async (req, res) => {
-  try {
-    const orgId = Number(req.user?.organizationId || 0);
-    if (!orgId) return res.status(401).json({ message: "Unauthorized (missing organization)" });
-
-    const query = `
-      SELECT
-        id,
-        organization_name,
-        username,
-        email,
-        contact_number,
-        pan_number
-      FROM organization_accounts
-      WHERE id = $1
-      LIMIT 1
-    `;
-    const result = await pool.query(query, [orgId]);
-
-    if (result.rows.length === 0) return res.status(404).json({ message: "Organization not found" });
-
-    const row = result.rows[0];
-
-    // map to front-end shape (choose names front expects)
-    const out = {
-      fullName: row.organization_name,
-      username: row.username,
-      companyName: row.organization_name,
-      email: row.email,
-      contactNumber: row.contact_number,
-      panNumber: row.pan_number,
-      accountCreatedDate: row.created_at,
-    };
-
-    return res.json(out);
-  } catch (err) {
-    console.error("Error fetching details:", err);
-    return res.status(500).json({ message: "Internal server error" });
-  }
-});
-
 app.post("/api/login", authLimiter, async (req, res) => {
   const { email, password } = req.body || {};
-  if (!email || !password) return res.status(400).json({ message: "Email and password required" });
+  if (!email || !password) {
+    return res.status(400).json({ message: "Email and password required" });
+  }
 
   try {
     const result = await pool.query("SELECT id, email, password, organization_id FROM login WHERE email = $1", [email]);
-    if (result.rows.length === 0) return res.status(401).json({ message: "Invalid email or password" });
+    if (result.rows.length === 0) {
+      return res.status(401).json({ message: "Invalid email or password" });
+    }
 
     const row = result.rows[0];
     const stored = row.password;
@@ -542,13 +495,15 @@ app.post("/api/login", authLimiter, async (req, res) => {
     if (typeof stored === "string" && stored.startsWith("$2")) {
       passwordMatches = await bcrypt.compare(password, stored);
     } else {
-      // legacy plaintext (shouldn't happen, but support rehash)
       if (password === stored) {
         passwordMatches = true;
         needsRehash = true;
       }
     }
-    if (!passwordMatches) return res.status(401).json({ message: "Invalid email or password" });
+
+    if (!passwordMatches) {
+      return res.status(401).json({ message: "Invalid email or password" });
+    }
 
     if (needsRehash) {
       try {
@@ -568,17 +523,141 @@ app.post("/api/login", authLimiter, async (req, res) => {
   }
 });
 
-// ------------------- AUTOMATION: rules + alerts -------------------
+app.get("/api/details", authenticateJWT, async (req, res) => {
+  try {
+    const orgId = Number(req.user?.organizationId || 0);
+    if (!orgId) {
+      return res.status(401).json({ message: "Unauthorized (missing organization)" });
+    }
+
+    const query = `
+      SELECT id, organization_name, username, email, contact_number, pan_number, created_at
+      FROM organization_accounts
+      WHERE id = $1
+      LIMIT 1
+    `;
+    const result = await pool.query(query, [orgId]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: "Organization not found" });
+    }
+
+    const row = result.rows[0];
+    const out = {
+      fullName: row.organization_name,
+      username: row.username,
+      companyName: row.organization_name,
+      email: row.email,
+      contactNumber: row.contact_number,
+      panNumber: row.pan_number,
+      accountCreatedDate: row.created_at,
+    };
+
+    return res.json(out);
+  } catch (err) {
+    return handleServerError(res, err, "Error fetching details:");
+  }
+});
+
+// ==================== EMAIL VERIFICATION ====================
+
+app.post("/api/send-verification", verificationLimiter, async (req, res) => {
+  const { email } = req.body || {};
+  if (!email) {
+    return res.status(400).json({ message: "Email required" });
+  }
+
+  if (!transporter) {
+    return res.status(500).json({ message: "Email service not configured" });
+  }
+
+  const normalized = String(email).trim().toLowerCase();
+
+  try {
+    const loginRes = await pool.query("SELECT id FROM login WHERE email = $1 LIMIT 1", [normalized]);
+    const loginId = loginRes.rows.length ? loginRes.rows[0].id : null;
+
+    const tokenPlain = crypto.randomBytes(24).toString("hex");
+    const tokenHash = crypto.createHash("sha256").update(tokenPlain).digest("hex");
+    const expiresAt = new Date(Date.now() + Number(process.env.CODE_EXPIRE_MINUTES || 15) * 60 * 1000);
+
+    await pool.query(
+      `INSERT INTO email_verification_tokens (login_id, email, token_hash, expires_at) VALUES ($1,$2,$3,$4)`,
+      [loginId, normalized, tokenHash, expiresAt]
+    );
+
+    const verifyUrl = `${process.env.APP_BASE_URL || "http://localhost:3000"}/api/verify-email?token=${tokenPlain}`;
+
+    const mailOptions = {
+      from: process.env.EMAIL_FROM,
+      to: normalized,
+      subject: "Verify your email",
+      text: `Click the link to verify your email: ${verifyUrl}\n\nThis link expires in ${process.env.CODE_EXPIRE_MINUTES || 15} minutes.`,
+      html: `<p>Click the link to verify your email:</p><p><a href="${verifyUrl}">Verify email</a></p><p>This link expires in ${process.env.CODE_EXPIRE_MINUTES || 15} minutes.</p>`,
+    };
+
+    transporter.sendMail(mailOptions).catch((err) => console.error("sendMail error:", err));
+
+    return res.status(200).json({ message: "If that email exists, a verification link has been sent." });
+  } catch (err) {
+    return handleServerError(res, err, "send-verification error:");
+  }
+});
+
+app.get("/api/verify-email", async (req, res) => {
+  const token = String(req.query.token || "");
+  if (!token) {
+    return res.status(400).send("Missing token");
+  }
+
+  try {
+    const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
+    const q = `SELECT id, login_id, email, expires_at, used FROM email_verification_tokens WHERE token_hash = $1 LIMIT 1`;
+    const r = await pool.query(q, [tokenHash]);
+
+    const redirectBase = process.env.APP_BASE_URL || "http://localhost:3000";
+
+    if (r.rows.length === 0) {
+      return res.redirect(`${redirectBase}/verified?status=invalid`);
+    }
+
+    const row = r.rows[0];
+    if (row.used) {
+      return res.redirect(`${redirectBase}/verified?status=used`);
+    }
+    if (new Date(row.expires_at) < new Date()) {
+      return res.redirect(`${redirectBase}/verified?status=expired`);
+    }
+
+    await pool.query("UPDATE email_verification_tokens SET used = true WHERE id = $1", [row.id]);
+
+    if (row.login_id) {
+      await pool.query("UPDATE login SET email_verified = true WHERE id = $1", [row.login_id]);
+    } else {
+      await pool.query("UPDATE login SET email_verified = true WHERE email = $1", [row.email]);
+    }
+
+    return res.redirect(`${redirectBase}/verified?status=success`);
+  } catch (err) {
+    console.error("verify-email error:", err);
+    const redirectBase = process.env.APP_BASE_URL || "http://localhost:3000";
+    return res.redirect(`${redirectBase}/verified?status=error`);
+  }
+});
+
+// ==================== AUTOMATION ROUTES ====================
 
 app.get("/api/rules", authenticateJWT, async (req, res) => {
   try {
     const ownerId = Number(req.user.organizationId || 0);
-    if (!ownerId) return res.status(400).json({ message: "Invalid organization" });
+    if (!ownerId) {
+      return res.status(400).json({ message: "Invalid organization" });
+    }
 
     const q = `SELECT id, owner_id, name, trigger, action, status, last_run, created_at, updated_at
                FROM automation_rules WHERE owner_id = $1 ORDER BY created_at DESC;`;
     const result = await pool.query(q, [ownerId]);
-    const rows = result.rows.map(r => {
+    const rows = result.rows.map((r) => {
       const out = toCamel(r);
       out.lastRun = r.last_run ? r.last_run.toISOString() : "";
       return out;
@@ -591,10 +670,14 @@ app.get("/api/rules", authenticateJWT, async (req, res) => {
 
 app.post("/api/rules", authenticateJWT, async (req, res) => {
   const ownerId = Number(req.user.organizationId || 0);
-  if (!ownerId) return res.status(400).json({ message: "Invalid organization" });
+  if (!ownerId) {
+    return res.status(400).json({ message: "Invalid organization" });
+  }
 
   const { name, trigger, action, status } = req.body || {};
-  if (!name || !trigger || !action) return res.status(400).json({ message: "name, trigger and action required" });
+  if (!name || !trigger || !action) {
+    return res.status(400).json({ message: "name, trigger and action required" });
+  }
 
   const st = status === "paused" ? "paused" : "active";
 
@@ -613,9 +696,10 @@ app.post("/api/rules", authenticateJWT, async (req, res) => {
 app.put("/api/rules/:id", authenticateJWT, async (req, res) => {
   const ownerId = Number(req.user.organizationId || 0);
   const id = Number(req.params.id);
-  if (!ownerId || !id) return res.status(400).json({ message: "Invalid organization or id" });
+  if (!ownerId || !id) {
+    return res.status(400).json({ message: "Invalid organization or id" });
+  }
 
-  // allow partial updates to name, trigger, action, status, last_run
   const allowed = ["name", "trigger", "action", "status", "last_run"];
   const sets = [];
   const vals = [];
@@ -626,7 +710,9 @@ app.put("/api/rules/:id", authenticateJWT, async (req, res) => {
       vals.push(req.body[key]);
     }
   }
-  if (sets.length === 0) return res.status(400).json({ message: "No updatable fields provided" });
+  if (sets.length === 0) {
+    return res.status(400).json({ message: "No updatable fields provided" });
+  }
 
   vals.push(ownerId);
   vals.push(id);
@@ -634,7 +720,9 @@ app.put("/api/rules/:id", authenticateJWT, async (req, res) => {
 
   try {
     const r = (await pool.query(sql, vals)).rows[0];
-    if (!r) return res.status(404).json({ message: "Rule not found" });
+    if (!r) {
+      return res.status(404).json({ message: "Rule not found" });
+    }
     const out = toCamel(r);
     out.lastRun = r.last_run ? r.last_run.toISOString() : "";
     return res.json(out);
@@ -646,26 +734,31 @@ app.put("/api/rules/:id", authenticateJWT, async (req, res) => {
 app.delete("/api/rules/:id", authenticateJWT, async (req, res) => {
   const ownerId = Number(req.user.organizationId || 0);
   const id = Number(req.params.id);
-  if (!ownerId || !id) return res.status(400).json({ message: "Invalid organization or id" });
+  if (!ownerId || !id) {
+    return res.status(400).json({ message: "Invalid organization or id" });
+  }
 
   try {
     const r = await pool.query("DELETE FROM automation_rules WHERE id = $1 AND owner_id = $2", [id, ownerId]);
-    if (r.rowCount === 0) return res.status(404).json({ message: "Rule not found" });
+    if (r.rowCount === 0) {
+      return res.status(404).json({ message: "Rule not found" });
+    }
     return res.json({ message: "Deleted" });
   } catch (err) {
     return handleServerError(res, err, "DELETE /api/rules/:id error:");
   }
 });
 
-/* Alerts */
 app.get("/api/alerts", authenticateJWT, async (req, res) => {
   try {
     const ownerId = Number(req.user.organizationId || 0);
-    if (!ownerId) return res.status(400).json({ message: "Invalid organization" });
+    if (!ownerId) {
+      return res.status(400).json({ message: "Invalid organization" });
+    }
 
     const q = `SELECT id, owner_id, type, title, message, time, status, created_at FROM automation_alerts WHERE owner_id = $1 ORDER BY time DESC;`;
     const result = await pool.query(q, [ownerId]);
-    const rows = result.rows.map(a => {
+    const rows = result.rows.map((a) => {
       const out = toCamel(a);
       out.time = a.time ? a.time.toISOString() : "";
       return out;
@@ -678,11 +771,16 @@ app.get("/api/alerts", authenticateJWT, async (req, res) => {
 
 app.post("/api/alerts", authenticateJWT, async (req, res) => {
   const ownerId = Number(req.user.organizationId || 0);
-  if (!ownerId) return res.status(400).json({ message: "Invalid organization" });
+  if (!ownerId) {
+    return res.status(400).json({ message: "Invalid organization" });
+  }
   const { type, title, message } = req.body || {};
-  if (!type || !title || !message) return res.status(400).json({ message: "type, title, message required" });
-
-  if (!["warning","error","success","info"].includes(type)) return res.status(400).json({ message: "Invalid type" });
+  if (!type || !title || !message) {
+    return res.status(400).json({ message: "type, title, message required" });
+  }
+  if (!["warning", "error", "success", "info"].includes(type)) {
+    return res.status(400).json({ message: "Invalid type" });
+  }
 
   try {
     const q = `INSERT INTO automation_alerts (owner_id, type, title, message) VALUES ($1,$2,$3,$4) RETURNING id, owner_id, type, title, message, time, status, created_at;`;
@@ -697,24 +795,31 @@ app.put("/api/alerts/:id/status", authenticateJWT, async (req, res) => {
   const ownerId = Number(req.user.organizationId || 0);
   const id = Number(req.params.id);
   const { status } = req.body || {};
-  if (!ownerId || !id) return res.status(400).json({ message: "Invalid organization or id" });
-  if (!["read","unread"].includes(status)) return res.status(400).json({ message: "Invalid status" });
+  if (!ownerId || !id) {
+    return res.status(400).json({ message: "Invalid organization or id" });
+  }
+  if (!["read", "unread"].includes(status)) {
+    return res.status(400).json({ message: "Invalid status" });
+  }
 
   try {
     const r = (await pool.query("UPDATE automation_alerts SET status = $1 WHERE id = $2 AND owner_id = $3 RETURNING id, status", [status, id, ownerId])).rows[0];
-    if (!r) return res.status(404).json({ message: "Alert not found" });
+    if (!r) {
+      return res.status(404).json({ message: "Alert not found" });
+    }
     return res.json(r);
   } catch (err) {
     return handleServerError(res, err, "PUT /api/alerts/:id/status error:");
   }
 });
 
-// ------------------- PRODUCTS -------------------
+// ==================== PRODUCTS ROUTES ====================
 
-// List products (simple read, no transaction overhead)
 app.get("/api/products", authenticateJWT, async (req, res) => {
   const ownerId = Number(req.user.organizationId || 0);
-  if (!ownerId) return res.status(400).json({ message: "Invalid organization" });
+  if (!ownerId) {
+    return res.status(400).json({ message: "Invalid organization" });
+  }
 
   try {
     const q = `
@@ -724,7 +829,6 @@ app.get("/api/products", authenticateJWT, async (req, res) => {
     const result = await pool.query(q, [ownerId]);
     const rows = result.rows.map((r) => {
       const c = toCamel(r);
-      // normalize types
       c.id = Number(r.product_id);
       c.price = Number(r.price);
       c.stock = Number(r.stock || 0);
@@ -737,35 +841,35 @@ app.get("/api/products", authenticateJWT, async (req, res) => {
   }
 });
 
-// POST product (multipart) - writes use transaction and set local owner for RLS if enabled
 app.post("/api/products", authenticateJWT, upload.single("image"), async (req, res) => {
   const ownerId = Number(req.user.organizationId || 0);
-  if (!ownerId) return res.status(400).json({ message: "Invalid organization" });
+  if (!ownerId) {
+    return res.status(400).json({ message: "Invalid organization" });
+  }
 
   const { name, description = "", price = "0", stock = "0" } = req.body || {};
-  if (!name || price == null || stock == null) return res.status(400).json({ message: "name, price, stock required" });
+  if (!name || price == null || stock == null) {
+    return res.status(400).json({ message: "name, price, stock required" });
+  }
 
   try {
-    // If uploaded to disk and Azure is configured, push to blob and remove local file
     let imageUrl = null;
     if (req.file) {
       if (containerClient) {
-        // upload and then delete local file
         const safeName = `${ownerId}/${Date.now()}-${req.file.filename}`;
         const blockBlobClient = containerClient.getBlockBlobClient(safeName);
         const buffer = fs.readFileSync(req.file.path);
-        await blockBlobClient.uploadData(buffer, { blobHTTPHeaders: { blobContentType: req.file.mimetype || "application/octet-stream" } });
+        await blockBlobClient.uploadData(buffer, {
+          blobHTTPHeaders: { blobContentType: req.file.mimetype || "application/octet-stream" },
+        });
         imageUrl = blockBlobClient.url;
-        // remove local file
         fs.unlink(req.file.path, () => {});
       } else {
-        // fallback: keep a local static path (not recommended for prod)
         imageUrl = `/uploads/${req.file.filename}`;
       }
     }
 
     const created = await withTransaction(async (client) => {
-      // If RLS enabled on DB, set local app.current_owner for policy evaluation
       try {
         await client.query(`SET LOCAL app.current_owner = '${ownerId}'`);
       } catch (_) {}
@@ -787,40 +891,50 @@ app.post("/api/products", authenticateJWT, upload.single("image"), async (req, r
   }
 });
 
-// PATCH stock (decrement) - transactional (kept for direct adjustments)
 app.patch("/api/products/:id/stock", authenticateJWT, async (req, res) => {
   const ownerId = Number(req.user.organizationId || 0);
-  if (!ownerId) return res.status(400).json({ message: "Invalid organization" });
+  if (!ownerId) {
+    return res.status(400).json({ message: "Invalid organization" });
+  }
   const productId = Number(req.params.id);
   const { quantity } = req.body || {};
   const qty = Number(quantity || 1);
-  if (!productId || qty <= 0) return res.status(400).json({ message: "Invalid product id or quantity" });
+  if (!productId || qty <= 0) {
+    return res.status(400).json({ message: "Invalid product id or quantity" });
+  }
 
   try {
     const updated = await withTransaction(async (client) => {
       await client.query(`SET LOCAL app.current_owner = '${ownerId}'`).catch(() => {});
       const check = await client.query("SELECT stock, orders_received FROM products WHERE product_id = $1 AND owner_id = $2 FOR UPDATE", [productId, ownerId]);
-      if (check.rows.length === 0) throw { status: 404, message: "Product not found" };
+      if (check.rows.length === 0) {
+        throw { status: 404, message: "Product not found" };
+      }
       const currentStock = Number(check.rows[0].stock || 0);
       const newStock = currentStock - qty;
-      if (newStock < 0) throw { status: 400, message: "Insufficient stock" };
+      if (newStock < 0) {
+        throw { status: 400, message: "Insufficient stock" };
+      }
       const upd = await client.query("UPDATE products SET stock = $1, orders_received = COALESCE(orders_received,0)+$2 WHERE product_id = $3 AND owner_id = $4 RETURNING product_id, stock, orders_received;", [newStock, qty, productId, ownerId]);
       const r = upd.rows[0];
       return { id: Number(r.product_id), stock: Number(r.stock), ordersReceived: Number(r.orders_received || 0) };
     });
     return res.json(updated);
   } catch (err) {
-    if (err && err.status) return res.status(err.status).json({ message: err.message });
+    if (err && err.status) {
+      return res.status(err.status).json({ message: err.message });
+    }
     return handleServerError(res, err, "PATCH /api/products/:id/stock error:");
   }
 });
 
-// ------------------- ORDERS -------------------
+// ==================== ORDERS ROUTES ====================
 
-// GET orders (reads) — returns itemized orders
 app.get("/api/orders", authenticateJWT, async (req, res) => {
   const ownerId = Number(req.user.organizationId || 0);
-  if (!ownerId) return res.status(400).json({ message: "Invalid organization" });
+  if (!ownerId) {
+    return res.status(400).json({ message: "Invalid organization" });
+  }
 
   try {
     const q = `
@@ -832,8 +946,7 @@ app.get("/api/orders", authenticateJWT, async (req, res) => {
     const result = await pool.query(q, [ownerId]);
     const orders = result.rows;
 
-    // fetch items for these orders in one query
-    const orderIds = orders.map(r => r.order_id);
+    const orderIds = orders.map((r) => r.order_id);
     let itemsByOrder = new Map();
     if (orderIds.length > 0) {
       const itemsQ = `
@@ -853,7 +966,7 @@ app.get("/api/orders", authenticateJWT, async (req, res) => {
           unitPrice: Number(it.unit_price),
           totalPrice: Number(it.total_price),
           fulfilled: Boolean(it.fulfilled),
-          createdAt: it.created_at
+          createdAt: it.created_at,
         });
         itemsByOrder.set(key, arr);
       }
@@ -874,7 +987,7 @@ app.get("/api/orders", authenticateJWT, async (req, res) => {
         remarks: r.remarks,
         createdAt: r.created_at,
         updatedAt: r.updated_at,
-        items: itemsByOrder.get(idNum) || []
+        items: itemsByOrder.get(idNum) || [],
       };
     });
 
@@ -884,11 +997,12 @@ app.get("/api/orders", authenticateJWT, async (req, res) => {
   }
 });
 
-// POST order (create + insert order_items + decrement stock + audit) - transactional
 app.post("/api/orders", authenticateJWT, async (req, res) => {
   const ownerId = Number(req.user.organizationId || 0);
   const loginId = Number(req.user.id || 0);
-  if (!ownerId) return res.status(400).json({ message: "Invalid organization" });
+  if (!ownerId) {
+    return res.status(400).json({ message: "Invalid organization" });
+  }
 
   const {
     customerName,
@@ -901,12 +1015,18 @@ app.post("/api/orders", authenticateJWT, async (req, res) => {
     items = [],
   } = req.body || {};
 
-  if (!customerName) return res.status(400).json({ message: "customerName required" });
+  if (!customerName) {
+    return res.status(400).json({ message: "customerName required" });
+  }
 
   const allowedOrderStatuses = ["Delivered", "Pending", "Cancelled"];
   const allowedPaymentStatuses = ["Paid", "Unpaid", "Refunded"];
-  if (!allowedOrderStatuses.includes(orderStatus)) return res.status(400).json({ message: "Invalid orderStatus" });
-  if (!allowedPaymentStatuses.includes(paymentStatus)) return res.status(400).json({ message: "Invalid paymentStatus" });
+  if (!allowedOrderStatuses.includes(orderStatus)) {
+    return res.status(400).json({ message: "Invalid orderStatus" });
+  }
+  if (!allowedPaymentStatuses.includes(paymentStatus)) {
+    return res.status(400).json({ message: "Invalid paymentStatus" });
+  }
 
   if (!Array.isArray(items) || items.length === 0) {
     return res.status(400).json({ message: "items array required with at least one item" });
@@ -919,7 +1039,9 @@ app.post("/api/orders", authenticateJWT, async (req, res) => {
 
   try {
     const created = await withTransaction(async (client) => {
-      try { await client.query(`SET LOCAL app.current_owner = '${ownerId}'`); } catch (_) {}
+      try {
+        await client.query(`SET LOCAL app.current_owner = '${ownerId}'`);
+      } catch (_) {}
 
       const q = `
         INSERT INTO orders (owner_id, customer_name, purchased_items, total_amount, order_status, payment_status, order_date, delivery_date, remarks, stock_adjusted)
@@ -933,13 +1055,10 @@ app.post("/api/orders", authenticateJWT, async (req, res) => {
 
       const insertedItems = [];
       let runningTotal = 0;
-      const productIds = [...new Set(items.map(i => Number(i.productId)))];
+      const productIds = [...new Set(items.map((i) => Number(i.productId)))];
 
-      const prodRes = await client.query(
-        `SELECT product_id, owner_id, price, stock FROM products WHERE product_id = ANY($1::int[]) AND owner_id = $2 FOR UPDATE`,
-        [productIds, ownerId]
-      );
-      const prodMap = new Map(prodRes.rows.map(r => [Number(r.product_id), { price: Number(r.price), stock: Number(r.stock || 0) }]));
+      const prodRes = await client.query(`SELECT product_id, owner_id, price, stock FROM products WHERE product_id = ANY($1::int[]) AND owner_id = $2 FOR UPDATE`, [productIds, ownerId]);
+      const prodMap = new Map(prodRes.rows.map((r) => [Number(r.product_id), { price: Number(r.price), stock: Number(r.stock || 0) }]));
 
       for (const it of items) {
         const productId = Number(it.productId);
@@ -955,13 +1074,7 @@ app.post("/api/orders", authenticateJWT, async (req, res) => {
         const totalPrice = Number((unitPrice * qty).toFixed(2));
         runningTotal += totalPrice;
 
-        await client.query(
-          `UPDATE products
-           SET stock = stock - $1,
-               orders_received = COALESCE(orders_received,0) + $1
-           WHERE product_id = $2 AND owner_id = $3`,
-          [qty, productId, ownerId]
-        );
+        await client.query(`UPDATE products SET stock = stock - $1, orders_received = COALESCE(orders_received,0) + $1 WHERE product_id = $2 AND owner_id = $3`, [qty, productId, ownerId]);
 
         const insertItemQ = `
           INSERT INTO order_items (order_id, product_id, owner_id, quantity, unit_price, total_price, fulfilled)
@@ -978,25 +1091,14 @@ app.post("/api/orders", authenticateJWT, async (req, res) => {
           unitPrice: Number(itemRow.unit_price),
           totalPrice: Number(itemRow.total_price),
           fulfilled: itemRow.fulfilled,
-          createdAt: itemRow.created_at
+          createdAt: itemRow.created_at,
         });
       }
 
-      const updOrder = await client.query(
-        `UPDATE orders SET total_amount = $1, stock_adjusted = true WHERE order_id = $2 RETURNING order_id, total_amount, order_status, payment_status, created_at, updated_at;`,
-        [Number(runningTotal.toFixed(2)), orderId]
-      );
+      const updOrder = await client.query(`UPDATE orders SET total_amount = $1, stock_adjusted = true WHERE order_id = $2 RETURNING order_id, total_amount, order_status, payment_status, created_at, updated_at;`, [Number(runningTotal.toFixed(2)), orderId]);
 
       const auditQ = `INSERT INTO order_audit (order_id, owner_id, action, changed_by_login_id, old_value, new_value, note) VALUES ($1,$2,$3,$4,$5,$6,$7)`;
-      await client.query(auditQ, [
-        orderId,
-        ownerId,
-        "create",
-        loginId,
-        null,
-        JSON.stringify({ order: updOrder.rows[0], items: insertedItems }),
-        `Created by login ${loginId}`
-      ]);
+      await client.query(auditQ, [orderId, ownerId, "create", loginId, null, JSON.stringify({ order: updOrder.rows[0], items: insertedItems }), `Created by login ${loginId}`]);
 
       const out = {
         id: Number(orderId),
@@ -1010,7 +1112,7 @@ app.post("/api/orders", authenticateJWT, async (req, res) => {
         remarks: remarks,
         createdAt: updOrder.rows[0].created_at,
         updatedAt: updOrder.rows[0].updated_at,
-        items: insertedItems
+        items: insertedItems,
       };
 
       return out;
@@ -1018,79 +1120,95 @@ app.post("/api/orders", authenticateJWT, async (req, res) => {
 
     return res.status(201).json(created);
   } catch (err) {
-    if (err && err.status) return res.status(err.status).json({ message: err.message });
+    if (err && err.status) {
+      return res.status(err.status).json({ message: err.message });
+    }
     return handleServerError(res, err, "POST /api/orders error:");
   }
 });
 
-// PATCH order payment (update payment_status + payment_date + audit) — does NOT reverse stock
 app.patch("/api/orders/:id/payment", authenticateJWT, async (req, res) => {
   const ownerId = Number(req.user.organizationId || 0);
   const loginId = Number(req.user.id || 0);
   const orderId = Number(req.params.id);
   const { paymentStatus } = req.body || {};
 
-  if (!ownerId) return res.status(400).json({ message: "Invalid organization" });
-  if (!orderId) return res.status(400).json({ message: "Invalid order id" });
-  if (!paymentStatus || !["Paid","Unpaid","Refunded"].includes(paymentStatus)) {
+  if (!ownerId) {
+    return res.status(400).json({ message: "Invalid organization" });
+  }
+  if (!orderId) {
+    return res.status(400).json({ message: "Invalid order id" });
+  }
+  if (!paymentStatus || !["Paid", "Unpaid", "Refunded"].includes(paymentStatus)) {
     return res.status(400).json({ message: "Invalid paymentStatus" });
   }
 
   try {
     const updated = await withTransaction(async (client) => {
-      try { await client.query(`SET LOCAL app.current_owner = '${ownerId}'`); } catch (_) {}
+      try {
+        await client.query(`SET LOCAL app.current_owner = '${ownerId}'`);
+      } catch (_) {}
 
       const orderRes = await client.query("SELECT order_id, payment_status FROM orders WHERE order_id = $1 AND owner_id = $2 FOR UPDATE", [orderId, ownerId]);
-      if (orderRes.rows.length === 0) throw { status: 404, message: "Order not found" };
+      if (orderRes.rows.length === 0) {
+        throw { status: 404, message: "Order not found" };
+      }
       const oldPayment = orderRes.rows[0].payment_status;
 
       if (oldPayment === paymentStatus) {
         return { id: orderId, paymentStatus: oldPayment, note: "No change" };
       }
 
+      let upd;
       if (paymentStatus === "Paid") {
-        const upd = await client.query("UPDATE orders SET payment_status = $1, payment_date = NOW() WHERE order_id = $2 AND owner_id = $3 RETURNING order_id, payment_status, payment_date, updated_at;", [paymentStatus, orderId, ownerId]);
-
-        const auditQ = `INSERT INTO order_audit (order_id, owner_id, action, changed_by_login_id, old_value, new_value, note) VALUES ($1,$2,$3,$4,$5,$6,$7)`;
-        await client.query(auditQ, [orderId, ownerId, "update_payment", loginId, JSON.stringify({ payment_status: oldPayment }), JSON.stringify({ payment_status: paymentStatus }), `Payment changed ${oldPayment} -> ${paymentStatus} by login ${loginId}`]);
-
-        return toCamel(upd.rows[0]);
+        upd = await client.query("UPDATE orders SET payment_status = $1, payment_date = NOW() WHERE order_id = $2 AND owner_id = $3 RETURNING order_id, payment_status, payment_date, updated_at;", [paymentStatus, orderId, ownerId]);
       } else {
-        const upd = await client.query("UPDATE orders SET payment_status = $1 WHERE order_id = $2 AND owner_id = $3 RETURNING order_id, payment_status, payment_date, updated_at;", [paymentStatus, orderId, ownerId]);
-
-        const auditQ = `INSERT INTO order_audit (order_id, owner_id, action, changed_by_login_id, old_value, new_value, note) VALUES ($1,$2,$3,$4,$5,$6,$7)`;
-        await client.query(auditQ, [orderId, ownerId, "update_payment", loginId, JSON.stringify({ payment_status: oldPayment }), JSON.stringify({ payment_status: paymentStatus }), `Payment changed ${oldPayment} -> ${paymentStatus} by login ${loginId}`]);
-
-        return toCamel(upd.rows[0]);
+        upd = await client.query("UPDATE orders SET payment_status = $1 WHERE order_id = $2 AND owner_id = $3 RETURNING order_id, payment_status, payment_date, updated_at;", [paymentStatus, orderId, ownerId]);
       }
+
+      const auditQ = `INSERT INTO order_audit (order_id, owner_id, action, changed_by_login_id, old_value, new_value, note) VALUES ($1,$2,$3,$4,$5,$6,$7)`;
+      await client.query(auditQ, [orderId, ownerId, "update_payment", loginId, JSON.stringify({ payment_status: oldPayment }), JSON.stringify({ payment_status: paymentStatus }), `Payment changed ${oldPayment} -> ${paymentStatus} by login ${loginId}`]);
+
+      return toCamel(upd.rows[0]);
     });
 
     return res.json(updated);
   } catch (err) {
-    if (err && err.status) return res.status(err.status).json({ message: err.message });
+    if (err && err.status) {
+      return res.status(err.status).json({ message: err.message });
+    }
     return handleServerError(res, err, "PATCH /api/orders/:id/payment error:");
   }
 });
 
-// PATCH order status (Delivered / Pending / Cancelled) — sets delivery_date when Delivered
 app.patch("/api/orders/:id/status", authenticateJWT, async (req, res) => {
   const ownerId = Number(req.user.organizationId || 0);
   const loginId = Number(req.user.id || 0);
   const orderId = Number(req.params.id);
   const { orderStatus } = req.body || {};
 
-  if (!ownerId) return res.status(400).json({ message: "Invalid organization" });
-  if (!orderId || !orderStatus) return res.status(400).json({ message: "orderId and orderStatus required" });
+  if (!ownerId) {
+    return res.status(400).json({ message: "Invalid organization" });
+  }
+  if (!orderId || !orderStatus) {
+    return res.status(400).json({ message: "orderId and orderStatus required" });
+  }
 
   const allowedOrderStatuses = ["Delivered", "Pending", "Cancelled"];
-  if (!allowedOrderStatuses.includes(orderStatus)) return res.status(400).json({ message: "Invalid orderStatus" });
+  if (!allowedOrderStatuses.includes(orderStatus)) {
+    return res.status(400).json({ message: "Invalid orderStatus" });
+  }
 
   try {
     const updated = await withTransaction(async (client) => {
-      try { await client.query(`SET LOCAL app.current_owner = '${ownerId}'`); } catch (_) {}
+      try {
+        await client.query(`SET LOCAL app.current_owner = '${ownerId}'`);
+      } catch (_) {}
 
       const check = await client.query("SELECT order_status, delivery_date FROM orders WHERE order_id = $1 AND owner_id = $2 FOR UPDATE", [orderId, ownerId]);
-      if (check.rows.length === 0) throw { status: 404, message: "Order not found" };
+      if (check.rows.length === 0) {
+        throw { status: 404, message: "Order not found" };
+      }
 
       const oldStatus = check.rows[0].order_status;
       const oldDelivery = check.rows[0].delivery_date;
@@ -1108,111 +1226,29 @@ app.patch("/api/orders/:id/status", authenticateJWT, async (req, res) => {
       }
 
       const auditQ = `INSERT INTO order_audit (order_id, owner_id, action, changed_by_login_id, old_value, new_value, note) VALUES ($1,$2,$3,$4,$5,$6,$7)`;
-      await client.query(auditQ, [
-        orderId,
-        ownerId,
-        "update_status",
-        loginId,
-        JSON.stringify({ order_status: oldStatus }),
-        JSON.stringify({ order_status: orderStatus }),
-        `Status changed ${oldStatus} -> ${orderStatus} by login ${loginId}`
-      ]);
+      await client.query(auditQ, [orderId, ownerId, "update_status", loginId, JSON.stringify({ order_status: oldStatus }), JSON.stringify({ order_status: orderStatus }), `Status changed ${oldStatus} -> ${orderStatus} by login ${loginId}`]);
 
       return toCamel(upd.rows[0]);
     });
 
     return res.json(updated);
   } catch (err) {
-    if (err && err.status) return res.status(err.status).json({ message: err.message });
+    if (err && err.status) {
+      return res.status(err.status).json({ message: err.message });
+    }
     return handleServerError(res, err, "PATCH /api/orders/:id/status error:");
   }
 });
-app.post("/api/send-verification", verificationLimiter, async (req, res) => {
-  const { email } = req.body || {};
-  if (!email) return res.status(400).json({ message: "Email required" });
 
-  const normalized = String(email).trim().toLowerCase();
-  try {
-    // find login (may not exist if user didn't finish register)
-    const loginRes = await pool.query("SELECT id FROM login WHERE email = $1 LIMIT 1", [normalized]);
-    const loginId = loginRes.rows.length ? loginRes.rows[0].id : null;
-
-    // generate token (plaintext to send), store hashed
-    const tokenPlain = crypto.randomBytes(24).toString("hex"); // 48 hex chars
-    const tokenHash = crypto.createHash("sha256").update(tokenPlain).digest("hex");
-    const expiresAt = new Date(Date.now() + (Number(process.env.CODE_EXPIRE_MINUTES || 15) * 60 * 1000));
-
-    await pool.query(
-      `INSERT INTO email_verification_tokens (login_id, email, token_hash, expires_at)
-       VALUES ($1,$2,$3,$4)`,
-      [loginId, normalized, tokenHash, expiresAt]
-    );
-
-    // link points to server verify endpoint which will mark email_verified = true and redirect to frontend
-    const verifyUrl = `${process.env.APP_BASE_URL || "http://localhost:3000"}/api/verify-email?token=${tokenPlain}`;
-
-    // mail payload
-    const mailOptions = {
-      from: process.env.EMAIL_FROM,
-      to: normalized,
-      subject: "Verify your email",
-      text: `Click the link to verify your email: ${verifyUrl}\n\nThis link expires in ${process.env.CODE_EXPIRE_MINUTES || 15} minutes.`,
-      html: `<p>Click the link to verify your email:</p><p><a href="${verifyUrl}">Verify email</a></p><p>This link expires in ${process.env.CODE_EXPIRE_MINUTES || 15} minutes.</p>`
-    };
-
-    transporter.sendMail(mailOptions).catch(err => console.error("sendMail error:", err));
-
-    // Generic response to avoid account enumeration
-    return res.status(200).json({ message: "If that email exists, a verification link has been sent." });
-  } catch (err) {
-    return handleServerError(res, err, "send-verification error:");
-  }
-});
-
-app.get("/api/verify-email", async (req, res) => {
-  const token = String(req.query.token || "");
-  if (!token) return res.status(400).send("Missing token");
-
-  try {
-    const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
-    const q = `SELECT id, login_id, email, expires_at, used FROM email_verification_tokens WHERE token_hash = $1 LIMIT 1`;
-    const r = await pool.query(q, [tokenHash]);
-
-    const redirectBase = process.env.APP_BASE_URL || "http://localhost:3000";
-
-    if (r.rows.length === 0) {
-      return res.redirect(`${redirectBase}/verified?status=invalid`);
-    }
-
-    const row = r.rows[0];
-    if (row.used) return res.redirect(`${redirectBase}/verified?status=used`);
-    if (new Date(row.expires_at) < new Date()) return res.redirect(`${redirectBase}/verified?status=expired`);
-
-    // mark token used
-    await pool.query("UPDATE email_verification_tokens SET used = true WHERE id = $1", [row.id]);
-
-    // set login.email_verified = true for the matching login (either by id or email)
-    if (row.login_id) {
-      await pool.query("UPDATE login SET email_verified = true WHERE id = $1", [row.login_id]);
-    } else {
-      await pool.query("UPDATE login SET email_verified = true WHERE email = $1", [row.email]);
-    }
-
-    return res.redirect(`${redirectBase}/verified?status=success`);
-  } catch (err) {
-    console.error("verify-email error:", err);
-    const redirectBase = process.env.APP_BASE_URL || "http://localhost:3000";
-    return res.redirect(`${redirectBase}/verified?status=error`);
-  }
-});
-
-
-// GET order audit entries
 app.get("/api/order-audit/:orderId", authenticateJWT, async (req, res) => {
   const ownerId = Number(req.user.organizationId || 0);
   const orderId = Number(req.params.orderId);
-  if (!ownerId) return res.status(400).json({ message: "Invalid organization" });
-  if (!orderId) return res.status(400).json({ message: "Invalid order id" });
+  if (!ownerId) {
+    return res.status(400).json({ message: "Invalid organization" });
+  }
+  if (!orderId) {
+    return res.status(400).json({ message: "Invalid order id" });
+  }
 
   try {
     const q = `SELECT id, order_id, owner_id, action, changed_by_login_id, old_value, new_value, note, created_at FROM order_audit WHERE order_id = $1 AND owner_id = $2 ORDER BY created_at DESC;`;
@@ -1223,23 +1259,62 @@ app.get("/api/order-audit/:orderId", authenticateJWT, async (req, res) => {
   }
 });
 
-// Health
-app.get("/api/health", (req, res) => res.json({ ok: true }));
+// ==================== HEALTH CHECK ====================
 
-// ------------------- Init -------------------
+app.get("/api/health", (req, res) => {
+  res.json({ ok: true, timestamp: new Date().toISOString() });
+});
+
+// ==================== GRACEFUL SHUTDOWN ====================
+
+let server;
+
+async function gracefulShutdown(signal) {
+  console.log(`\n${signal} received, shutting down gracefully...`);
+  
+  if (server) {
+    server.close(() => {
+      console.log("HTTP server closed");
+    });
+  }
+
+  try {
+    await pool.end();
+    console.log("Database pool closed");
+  } catch (err) {
+    console.error("Error closing database pool:", err);
+  }
+
+  process.exit(0);
+}
+
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+
+// ==================== INITIALIZATION ====================
+
 async function init() {
   try {
-    await pool.connect();
-    console.log("✅ PostgreSQL pool connected");
-    await ensureTablesAndConstraints();
-    const PORT = process.env.PORT || 3001;
-    const HOST = process.env.HOST || "0.0.0.0";
-    app.listen(PORT, HOST, () => console.log(`Server listening on http://${HOST}:${PORT}`));
+    // Test database connection
+    const client = await pool.connect();
+    await client.query("SELECT 1");
+    client.release();
+    console.log("✅ PostgreSQL connected successfully");
 
+    // Ensure tables exist
+    await ensureTablesAndConstraints();
+
+    // Start server
+    server = app.listen(PORT, HOST, () => {
+      console.log(`🚀 Server listening on http://${HOST}:${PORT}`);
+      console.log(`📝 Environment: ${process.env.NODE_ENV || "development"}`);
+      console.log(`🔒 CORS allowed origins: ${allowedOrigins.join(", ")}`);
+    });
   } catch (err) {
-    console.error("Fatal init error:", err);
+    console.error("❌ Fatal initialization error:", err);
     process.exit(1);
   }
 }
 
+// Start the server
 init();
