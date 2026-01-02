@@ -33,22 +33,8 @@ const HOST = process.env.HOST || "0.0.0.0";
 
 // ==================== CORS SETUP ====================
 
-const rawOrigins = process.env.CORS_ORIGINS || process.env.CORS_ORIGIN || "*";
-const allowedOrigins = rawOrigins
-  ? rawOrigins.split(",").map((s) => s.trim()).filter(Boolean)
-  : ["http://localhost:3000", "http://127.0.0.1:3000" ];
-
 const corsOptions = {
-  origin: function (origin, callback) {
-    if (!origin) {
-      console.log("CORS: no origin (curl / mobile webview?) - allow");
-      return callback(null, true);
-    }
-    console.log("CORS: request origin:", origin);
-    if (allowedOrigins.includes(origin)) return callback(null, true);
-    console.warn("CORS: origin not allowed:", origin);
-    return callback(new Error("CORS: Origin not allowed by server"), false);
-  },
+  origin: true, // <-- allow any origin
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization", "Accept", "X-Requested-With"],
   exposedHeaders: ["Authorization"],
@@ -58,7 +44,6 @@ const corsOptions = {
 };
 
 app.use(cors(corsOptions));
-
 // ==================== RATE LIMITERS ====================
 
 const authLimiter = rateLimit({
