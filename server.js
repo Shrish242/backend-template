@@ -30,16 +30,7 @@ const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || "7d";
 const PORT = process.env.PORT || 3001;
 const HOST = process.env.HOST || "0.0.0.0";
 
-// ====== CORS: ACCEPT EVERYTHING (VERCEL SAFE) ======
-app.use(cors({
-  origin: true, // 👈 allow ALL origins (for now)
-  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"],
-}));
-
-// 👇 MUST exist or preflight fails on Vercel
-app.options("*", cors());
-
+app.use(cors());
 app.use(express.json());
 
 // ==================== RATE LIMITERS ====================
