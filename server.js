@@ -33,19 +33,20 @@ const HOST = process.env.HOST || "0.0.0.0";
 
 // ==================== CORS SETUP ====================
 
-const corsOptions = {
-   origin: [
-    "https://ecommerce-manage-frontend-ewq7.vercel.app"
-  ],
-  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization", "Accept", "X-Requested-With"],
-  exposedHeaders: ["Authorization"],
-  credentials: true,
-  optionsSuccessStatus: 204,
-  preflightContinue: false,
-};
+app.use(cors({
+  origin: "https://ecommerce-manage-frontend-ewq7.vercel.app",
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  credentials: false
+}));
 
-app.use(cors(corsOptions));
+// 👇 REQUIRED for Vercel
+app.options("*", (req, res) => {
+  res.setHeader("Access-Control-Allow-Origin", "https://ecommerce-manage-frontend-ewq7.vercel.app");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  return res.status(200).end();
+});
 // ==================== RATE LIMITERS ====================
 
 const authLimiter = rateLimit({
