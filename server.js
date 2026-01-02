@@ -35,7 +35,8 @@ const HOST = process.env.HOST || "0.0.0.0";
 const corsOptions = {
     origin: [
         'https://ecommerce-manage-frontend-ewq7.vercel.app', // Your specific frontend URL
-        'http://localhost:3000' // Keep localhost for development
+        'http://localhost:3000', // Keep localhost for development
+        'https://backend-template-58uoqaq4r-srs-projects-c448f20f.vercel.app/api/login'
     ],
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     credentials: true // Allow cookies/headers if needed
