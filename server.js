@@ -16,27 +16,41 @@ const nodemailer = require("nodemailer");
 
 const app = express();
 
-// CRITICAL: Add CORS headers to EVERY response (must be FIRST)
-app.use((req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  res.setHeader('Access-Control-Allow-Credentials', 'true');
-  
-  // Handle preflight requests
-  if (req.method === 'OPTIONS') {
-    return res.status(200).end();
-  }
-  
-  next();
-});
+// ==================== FIXED CORS SETUP ====================
+// Replaces the manual middleware that was causing the error
+app.use(cors({
+  // Dynamically allow origins to support Vercel previews & localhost
+  origin: function (origin, callback) {
+    // allow requests with no origin (like mobile apps or curl requests)
+    if (!origin) return callback(null, true);
+    
+    // Check if the origin is one of your allowed domains
+    const allowedOrigins = [
+      'https://ecommerce-manage-frontend-ewq7-git-master-srs-projects-c448f20f.vercel.app', // Your specific frontend
+      'https://ecommerce-manage-frontend-ewq7.vercel.app', // Your main Vercel app
+      'http://localhost:3000' // Local development
+    ];
+
+    // OR: Allow all Vercel subdomains (easier for previews)
+    if (allowedOrigins.indexOf(origin) !== -1 || origin.endsWith('.vercel.app')) {
+      return callback(null, true);
+    } else {
+      // For debugging, you might want to log blocked origins
+      console.log("Blocked by CORS:", origin);
+      return callback(new Error('Not allowed by CORS'));
+    }
+  },
+  credentials: true, // This allows cookies/auth headers
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
+// ==========================================================
 
 app.use(helmet({
   crossOriginResourcePolicy: false,
 }));
 
 app.use(express.json());
-
 // ==================== CONFIGURATION ====================
 
 // Enforce required env vars
@@ -51,19 +65,6 @@ const PORT = process.env.PORT || 3001;
 const HOST = process.env.HOST || "0.0.0.0";
 
 
-// ==================== RATE LIMITERS ====================
-
-const authLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 10,
-  message: { message: "Too many requests, slow down" },
-});
-
-const verificationLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 3,
-  message: "Too many verification requests, please try again later.",
-});
 
 // ==================== DATABASE SETUP ====================
 
