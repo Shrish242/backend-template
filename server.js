@@ -15,7 +15,27 @@ const crypto = require("crypto");
 const nodemailer = require("nodemailer");
 
 const app = express();
-app.use(helmet());
+
+// CRITICAL: Add CORS headers to EVERY response (must be FIRST)
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
+  
+  // Handle preflight requests
+  if (req.method === 'OPTIONS') {
+    return res.status(200).end();
+  }
+  
+  next();
+});
+
+app.use(helmet({
+  crossOriginResourcePolicy: false,
+}));
+
+app.use(express.json());
 
 // ==================== CONFIGURATION ====================
 
@@ -30,8 +50,6 @@ const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || "7d";
 const PORT = process.env.PORT || 3001;
 const HOST = process.env.HOST || "0.0.0.0";
 
-app.use(cors());
-app.use(express.json());
 
 // ==================== RATE LIMITERS ====================
 
@@ -443,42 +461,61 @@ app.post("/api/register", authLimiter, async (req, res) => {
     return handleServerError(res, err, "Register error:");
   }
 });
-
 app.post("/api/login", authLimiter, async (req, res) => {
+  console.log("=== Login attempt ===");
+  console.log("Request body:", req.body);
+  console.log("Request headers:", req.headers);
+  
   const { email, password } = req.body || {};
+  
   if (!email || !password) {
+    console.log("Missing email or password");
     return res.status(400).json({ message: "Email and password required" });
   }
 
   try {
+    console.log("Querying database for email:", email);
     const result = await pool.query("SELECT id, email, password, organization_id FROM login WHERE email = $1", [email]);
+    
+    console.log("Query result rows:", result.rows.length);
+    
     if (result.rows.length === 0) {
+      console.log("No user found with email:", email);
       return res.status(401).json({ message: "Invalid email or password" });
     }
 
     const row = result.rows[0];
+    console.log("Found user:", { id: row.id, email: row.email, hasPassword: !!row.password });
+    
     const stored = row.password;
     let passwordMatches = false;
     let needsRehash = false;
 
     if (typeof stored === "string" && stored.startsWith("$2")) {
+      console.log("Comparing bcrypt password");
       passwordMatches = await bcrypt.compare(password, stored);
     } else {
+      console.log("Plain text password comparison");
       if (password === stored) {
         passwordMatches = true;
         needsRehash = true;
       }
     }
 
+    console.log("Password matches:", passwordMatches);
+
     if (!passwordMatches) {
+      console.log("Password mismatch");
       return res.status(401).json({ message: "Invalid email or password" });
     }
 
     if (needsRehash) {
       try {
+        console.log("Rehashing password");
         const newHash = await bcrypt.hash(password, 12);
         await pool.query("UPDATE login SET password = $1 WHERE id = $2", [newHash, row.id]);
         await pool.query("UPDATE organization_accounts SET password = $1 WHERE id = $2", [newHash, row.organization_id]).catch(() => {});
+        console.log("Password rehashed successfully");
       } catch (e) {
         console.warn("Rehash failed:", e);
       }
@@ -486,8 +523,15 @@ app.post("/api/login", authLimiter, async (req, res) => {
 
     const user = { id: row.id, email: row.email, organizationId: row.organization_id };
     const token = signToken(user);
+    
+    console.log("Login successful for user:", user.id);
+    console.log("=== Login complete ===");
+    
     return res.status(200).json({ user, token });
   } catch (err) {
+    console.error("=== Login error ===");
+    console.error("Error details:", err);
+    console.error("Error stack:", err.stack);
     return handleServerError(res, err, "Login error:");
   }
 });
@@ -1277,7 +1321,7 @@ async function init() {
     server = app.listen(PORT, HOST, () => {
       console.log(`🚀 Server listening on http://${HOST}:${PORT}`);
       console.log(`📝 Environment: ${process.env.NODE_ENV || "development"}`);
-      console.log(`🔒 CORS allowed origins: ${allowedOrigins.join(", ")}`);
+      console.log(`🔒 CORS: Accepting all origins (*)`);
     });
   } catch (err) {
     console.error("❌ Fatal initialization error:", err);
