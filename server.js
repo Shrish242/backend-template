@@ -2,6 +2,7 @@
 require("dotenv").config();
 const express = require("express");
 const helmet = require("helmet");
+const cors = require("cors");
 const { Pool } = require("pg");
 const multer = require("multer");
 const fs = require("fs");
@@ -31,19 +32,16 @@ const PORT = process.env.PORT || 3001;
 const HOST = process.env.HOST || "0.0.0.0";
 
 // ====== CORS: ACCEPT EVERYTHING (VERCEL SAFE) ======
-app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "*");
+const corsOptions = {
+    origin: [
+        'https://ecommerce-manage-frontend-ewq7.vercel.app', // Your specific frontend URL
+        'http://localhost:3000' // Keep localhost for development
+    ],
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    credentials: true // Allow cookies/headers if needed
+};
 
-  if (req.method === "OPTIONS") {
-    return res.status(200).end();
-  }
-
-  next();
-});
-
-app.use(express.json());
+app.use(cors(corsOptions));
 
 // ==================== RATE LIMITERS ====================
 
